@@ -238,6 +238,29 @@ def enable_high_resolution_timer() -> bool:
     return False
 
 
+def prevent_sleep() -> bool:
+    """Keep Windows from going to sleep while this process runs (best effort).
+
+    Uses SetThreadExecutionState; nothing is changed in the power settings and
+    the request ends automatically when the process exits. The screen may still
+    turn off, which is fine. Closing a laptop lid or choosing Sleep manually
+    still puts the PC to sleep.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        k32 = ctypes.WinDLL("kernel32")
+        k32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
+        k32.SetThreadExecutionState.restype = ctypes.c_uint32
+        return k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0
+    except Exception as exc:
+        log.debug("SetThreadExecutionState failed: %s", exc)
+        return False
+
+
 def boost_priority() -> bool:
     """Raise this process to HIGH priority so the trigger is not delayed (best effort)."""
     if sys.platform != "win32":

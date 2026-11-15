@@ -108,8 +108,8 @@ In PowerShell:
 
 ```powershell
 cd $HOME\Desktop
-git clone https://github.com/Williampetersen/mt5-hedge-timer.git
-cd mt5-hedge-timer
+git clone https://github.com/Williampetersen/mt5-hedge-timer.git Trade2026
+cd Trade2026
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 ```
 
@@ -220,9 +220,16 @@ so close the demo positions in MT5 if you want to test again on the same day.
 
 ## 9. The scheduled run
 
+**Double-click `START.bat`** in the project folder. It starts both apps (BUY and
+SELL). They wait until the scheduled time in your configs, open at that exact
+moment, and then watch the positions. Keep the window open. While it runs,
+Windows will not go to sleep. The screen may still turn off, which is fine.
+
+The same from PowerShell:
+
 ```powershell
-scripts\start_both.bat            # validate the pair, then run today's (or the next) scheduled trade
-scripts\start_both.bat --loop     # keep running and trade on every scheduled day
+.\START.bat                       # validate the pair, then run today's (or the next) scheduled trade
+.\START.bat --loop                # keep running and trade on every scheduled day
 ```
 
 Or start one side on its own: `scripts\start_buy.bat`, `scripts\start_sell.bat`
@@ -350,8 +357,8 @@ The repository is private, so log in to GitHub first:
 ```powershell
 winget install GitHub.cli
 gh auth login
-gh repo clone Williampetersen/mt5-hedge-timer
-cd mt5-hedge-timer
+gh repo clone Williampetersen/mt5-hedge-timer $HOME\Desktop\Trade2026
+cd $HOME\Desktop\Trade2026
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 ```
 
@@ -398,6 +405,7 @@ guard, the retry rules, and full simulated runs.
 ## Project layout
 
 ```
+START.bat            double-click: runs BUY + SELL at the scheduled time
 hedgebot/            the engine (one codebase for both apps)
   __main__.py        CLI + the daily run (wait, prearm, fire, correct TP, monitor, journal)
   config.py          YAML + .env loading and validation

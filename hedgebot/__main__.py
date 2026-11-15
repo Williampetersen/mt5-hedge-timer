@@ -585,6 +585,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     setup_logging(cfg, Path(args.log_dir), args.verbose)
     clk.enable_high_resolution_timer()
+    if not args.check and clk.prevent_sleep():
+        log.info("Windows will not go to sleep while this app runs (keep this window open)")
     notifier = Notifier(cfg.telegram_token, cfg.telegram_chat_id, prefix=cfg.name)
     app = HedgeApp(cfg, dry_run=args.dry_run, notifier=notifier, journal=Journal(args.journal))
     try:
