@@ -1,0 +1,9 @@
+# Pinned versions. MetaTrader5 only exists for Windows; the marker lets the
+# tests (which mock MT5) install and run on any OS.
+MetaTrader5==5.0.6231 ; sys_platform == "win32"
+pyyaml==6.0.3
+python-dotenv==1.2.4
+tzdata==2026.6
+ntplib==0.4.0
+requests==2.34.2
+pytest==9.2.0

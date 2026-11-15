@@ -1,0 +1,16 @@
+# Secrets and personal configs (only the *.example.* files are committed)
+.env
+config/buy.yaml
+config/sell.yaml
+
+# Environment and runtime output
+.venv/
+logs/
+data/
+__pycache__/
+*.log
+*.pyc
+.pytest_cache/
+
+# Compiled MQL5
+*.ex5

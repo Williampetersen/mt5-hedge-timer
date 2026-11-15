@@ -1,0 +1,43 @@
+# SELL app config. Copy to config/sell.yaml (scripts/setup.ps1 does this) and edit.
+# trade.symbol/lots/tp/sl and schedule.time/timezone/weekdays/dates MUST match
+# config/buy.yaml - run_pair.py refuses to start otherwise.
+
+name: sell-account                # used in logs/journal (letters, digits, . _ -)
+direction: sell                   # buy | sell  (must be opposite in the two files)
+
+account:
+  login: 87654321                 # your second MT5 account number (example value is rejected)
+  server: "BrokerName-Server"     # exactly as shown in the MT5 login dialog
+  password_env: SELL_MT5_PASSWORD # name of the variable in .env (password is NEVER in YAML)
+  terminal_path: 'C:\MT5_Sell\terminal64.exe'  # a DIFFERENT MT5 installation than the buy side
+  portable: false                 # true if this MT5 copy runs in portable mode
+  allow_real_account: false       # if false, refuse to trade unless the account is DEMO
+
+trade:
+  symbol: XAUUSD                  # exact Market Watch name, incl. suffix (e.g. XAUUSD.m)
+  lots: 0.06
+  tp_money: 150.0                 # TP in account currency from the fill price; null = no TP
+  tp_points: null                 # alternative: TP in points (use only one of tp_money/tp_points)
+  sl_money: null                  # null = no stop loss (default)
+  sl_points: null
+  deviation_points: 300           # max slippage
+  magic: 20261115
+  comment: "HedgeTimer"           # max 31 characters
+  max_spread_points: null         # null = no spread filter; if set and spread is wider, skip and log
+  check_margin: true              # log + notify if free margin < required margin before sending
+
+schedule:
+  time: "14:29:45"                # HH:MM:SS - keep the quotes!
+  timezone: "Europe/Copenhagen"   # IANA name; handles summer/winter time automatically
+  weekdays: [Mon, Tue, Wed, Thu, Fri]
+  dates: []                       # e.g. ["2026-12-05", "2026-12-10"]; if not empty, ONLY these dates
+  max_late_ms: 2000               # if we are later than this after the target, do NOT open
+  prearm_seconds: 30              # connect, select symbol, warm up ticks this many seconds before
+  use_ntp_offset: true            # correct PC clock error using NTP
+  ntp_server: "pool.ntp.org"
+  max_clock_offset_ms: 500        # warn (and notify) if PC clock is off by more than this
+
+monitor:
+  enabled: true                   # after opening, watch the position until it closes
+  until: "23:00:00"               # stop monitoring at this local time (position stays open in MT5)
+  poll_seconds: 1
