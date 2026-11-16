@@ -45,7 +45,9 @@ EXIT_SKIPPED = 3
 EXIT_INTERRUPTED = 130
 
 RESULT_PREFIX = "HEDGEBOT_RESULT "  # machine-readable line for run_pair.py
+EVENT_PREFIX = "HEDGEBOT_EVENT "  # machine-readable progress lines for the desktop app
 CHILD_ENV = "HEDGEBOT_CHILD"
+PNL_EVENT_EVERY_S = 2.0
 
 
 # --------------------------------------------------------------------------- logging
@@ -162,6 +164,7 @@ class HedgeApp:
         self.emit_results = bool(os.environ.get(CHILD_ENV)) if emit_results is None else emit_results
         self.tz = cfg.schedule.tz
         self._digits = 5
+        self._last_pnl_event = 0.0
 
     # ---------------------------------------------------------------- helpers
 
@@ -188,7 +191,8 @@ class HedgeApp:
         side = "behind" if ms > 0 else "ahead of"
         if abs(ms) > s.max_clock_offset_ms:
             msg = (f"PC clock is {abs(ms):.0f} ms {side} NTP time (> {s.max_clock_offset_ms:g} ms). "
-                   "Scheduling is corrected, but fix Windows time sync (see README).")
+                   "The app corrects for it, but it is better to fix the PC clock: Windows Settings > "
+                   "Time & language > Date & time > Sync now.")
             log.warning(msg)
             self.notify("WARNING: " + msg)
         else:
@@ -208,13 +212,58 @@ class HedgeApp:
         for w in c.warnings:
             log.warning("Config: %s", w)
 
-    def _emit(self, target_ts: float, status: str, res: Optional[SendResult] = None) -> None:
+    def _event(self, stage: str, **data) -> None:
+        """One progress line for the program that started us (ignored when run by hand)."""
+        if not self.emit_results:
+            return
+        payload = {"stage": stage, "name": self.cfg.name, "direction": self.cfg.direction}
+        payload.update(data)
+        try:
+            print(EVENT_PREFIX + json.dumps(payload, default=str), flush=True)
+        except Exception as exc:  # reporting must never break trading
+            log.debug("could not write the %s event: %s", stage, exc)
+
+    def _snapshot(self, client, pf: Preflight) -> dict:
+        """Account, price, TP and margin facts after a successful preflight."""
+        acc, t = client.account, self.cfg.trade
+        return {
+            "login": int(getattr(acc, "login", 0) or 0),
+            "server": str(getattr(acc, "server", "") or self.cfg.account.server),
+            "account_kind": pf.account_kind,
+            "hedging": pf.hedging,
+            "currency": pf.currency,
+            "balance": float(getattr(acc, "balance", 0.0) or 0.0),
+            "leverage": int(getattr(acc, "leverage", 0) or 0),
+            "symbol": pf.symbol,
+            "digits": pf.digits,
+            "bid": pf.bid,
+            "ask": pf.ask,
+            "spread_points": pf.spread_points,
+            "lots": t.lots,
+            "tp": t.describe_tp(pf.currency),
+            "tp_price": pf.tp_preview,
+            "tp_distance": pf.tp_distance,
+            "sl": t.describe_sl(pf.currency),
+            "sl_price": pf.sl_preview,
+            "margin_required": pf.margin_required,
+            "margin_free": pf.margin_free,
+            "margin_warning": pf.margin_warning,
+        }
+
+    def _pnl_update(self, profit: float) -> None:
+        now = time.monotonic()
+        if now - self._last_pnl_event >= PNL_EVENT_EVERY_S:
+            self._last_pnl_event = now
+            self._event("pnl", profit=profit)
+
+    def _emit(self, target_ts: float, status: str, res: Optional[SendResult] = None, note: str = "") -> None:
         if not self.emit_results:
             return
         payload = {
             "name": self.cfg.name,
             "direction": self.cfg.direction,
             "status": status,
+            "note": note,
             "target_ts": target_ts,
             "send_ts": res.send_ts if res else None,
             "send_pc_ts": res.send_pc_ts if res else None,
@@ -291,7 +340,8 @@ class HedgeApp:
             if dist is None:
                 log.info("%s: none", label)
             else:
-                amount = f"{money:.2f} {pf.currency}" if money is not None else f"{points:g} points"
+                amount = (f"{money:.2f} {t.money_label(pf.currency)}" if money is not None
+                          else f"{points:g} points")
                 log.info("%s %s = %.*f price distance (%.0f points); at the current price %s would be %.*f",
                          label, amount, d, dist, dist / pf.point, label, d, preview)
         if pf.margin_required is not None:
@@ -328,9 +378,16 @@ class HedgeApp:
                 log.warning("On %s the app would SKIP: %s", day.isoformat(), reason)
             log.info("CHECK PASSED for %s (%s account %s). Nothing was sent.", self.cfg.name, pf.account_kind,
                      self.cfg.account.login)
+            self._event("check", ok=True, skip_reason=reason or "",
+                        clock_offset_ms=self.clock.offset_s * 1000.0, **self._snapshot(client, pf))
             return EXIT_OK
         except Mt5Error as exc:
             log.error("CHECK FAILED: %s", exc)
+            self._event("check", ok=False, error=str(exc))
+            return EXIT_ERROR
+        except Exception as exc:  # e.g. the MT5 package itself failing: report it, do not just die
+            log.exception("CHECK FAILED (unexpected): %s", exc)
+            self._event("check", ok=False, error=f"unexpected error: {exc}")
             return EXIT_ERROR
         finally:
             if client is not None:
@@ -349,6 +406,8 @@ class HedgeApp:
         target_ts = target.timestamp()
         log.info("Target %s (%s) in %s [%s]", self.fmt(target_ts), clk.fmt_utc(target_ts),
                  clk.fmt_duration(target_ts - self.clock.time()), "DRY-RUN" if self.dry_run else "LIVE")
+        self._event("waiting", target_ts=target_ts, dry_run=self.dry_run,
+                    prearm_ts=target_ts - s.prearm_seconds, clock_offset_ms=self.clock.offset_s * 1000.0)
 
         prearm_ts = target_ts - s.prearm_seconds
         if self.clock.time() < prearm_ts:
@@ -366,13 +425,14 @@ class HedgeApp:
             log.error("SKIPPED: %s", msg)
             self.notify("SKIPPED: " + msg)
             self._journal(target_ts, "skipped_late", msg)
-            self._emit(target_ts, "skipped_late")
+            self._emit(target_ts, "skipped_late", note=msg)
             return EXIT_SKIPPED
         return self._armed_run(target_ts)
 
     def _armed_run(self, target_ts: float) -> int:
         c, s = self.cfg, self.cfg.schedule
         log.info("PREARM: %.1f s before the target", target_ts - self.clock.time())
+        self._event("prearm", target_ts=target_ts)
         self.sync_clock("prearm")
         if self.boost:
             clk.boost_priority()
@@ -398,7 +458,7 @@ class HedgeApp:
                 self.notify(f"SKIPPED: {reason}")
                 self._journal(target_ts, "skipped_exists", reason)
                 journaled = True
-                self._emit(target_ts, "skipped_exists")
+                self._emit(target_ts, "skipped_exists", note=reason)
                 return EXIT_SKIPPED
 
             lead = target_ts - self.clock.time()
@@ -407,6 +467,8 @@ class HedgeApp:
             if lead < 2:
                 log.warning("Prearm finished only %.1f s before the target; consider a larger prearm_seconds",
                             lead)
+            self._event("armed", target_ts=target_ts, dry_run=self.dry_run,
+                        clock_offset_ms=self.clock.offset_s * 1000.0, **self._snapshot(client, pf))
             self.notify(f"ARMED: {c.direction.upper()} {c.trade.lots:g} {pf.symbol} at {self.fmt(target_ts)}, "
                         f"TP {c.trade.describe_tp(pf.currency)}, SL {c.trade.describe_sl(pf.currency)}"
                         + (" (dry-run)" if self.dry_run else ""))
@@ -418,7 +480,10 @@ class HedgeApp:
                                   max_spread_points=c.trade.max_spread_points)
 
             self._log_send(res, pf)
-            self._emit(target_ts, res.status, res)
+            note = res.comment if res.status != "opened" else ""
+            if res.status == "failed":
+                note = f"{tm.retcode_text(res.retcode)} {res.comment}".strip()
+            self._emit(target_ts, res.status, res, note=note)
 
             if res.status == "dry_run":
                 self.notify(f"DRY-RUN OK: order_check passed at {self.fmt(res.send_ts)} "
@@ -450,6 +515,11 @@ class HedgeApp:
             )
             if tp_error:
                 self.notify("ERROR: " + tp_error)
+            self._event("opened", ticket=res.position_ticket, volume=res.volume or c.trade.lots,
+                        symbol=pf.symbol, digits=d, currency=pf.currency, fill_price=res.fill_price,
+                        requested_price=res.requested_price, slippage_points=res.slippage_points,
+                        tp_price=res.tp_price, sl_price=res.sl_price, deviation_ms=res.deviation_ms,
+                        latency_ms=res.latency_ms, spread_points=res.spread_points, tp_error=tp_error or "")
             # Record the trade now; the close details are filled into the same row later.
             self._journal(target_ts, "opened", tp_error or ("monitoring" if c.monitor.enabled else ""), res)
             if not c.monitor.enabled:
@@ -460,7 +530,8 @@ class HedgeApp:
                 until = self.monitor_until(target_ts)
                 log.info("Monitoring until %s", self.fmt(until))
                 try:
-                    close = client.monitor(res, until, c.monitor.poll_seconds)
+                    self._event("monitoring", until_ts=until)
+                    close = client.monitor(res, until, c.monitor.poll_seconds, on_update=self._pnl_update)
                 except KeyboardInterrupt:
                     close = CloseInfo(reason="still open (monitor interrupted)")
                     raise
@@ -473,9 +544,13 @@ class HedgeApp:
                     self.notify(f"CLOSED by {close.reason} at {_f(close.close_price, d)}: profit "
                                 f"{_f(close.profit, 2)} {pf.currency}, swap {_f(close.swap, 2)}, commission "
                                 f"{_f(close.commission, 2)}, duration {clk.fmt_duration(close.duration_s or 0)}")
+                    self._event("closed", reason=close.reason, close_price=close.close_price,
+                                profit=close.profit, swap=close.swap, commission=close.commission,
+                                duration_s=close.duration_s, currency=pf.currency, digits=d)
                 else:
                     self.notify(f"Monitor ended, position #{res.position_ticket} still open "
                                 f"(P/L {_f(close.last_profit, 2)} {pf.currency})")
+                    self._event("monitor_ended", profit=close.last_profit, currency=pf.currency)
             self._journal(target_ts, "opened", tp_error or "", res, close)
             journaled = True
             return EXIT_OK
@@ -486,7 +561,9 @@ class HedgeApp:
                 self._journal(target_ts, "error", str(exc), res)
                 journaled = True
             if res is None:
-                self._emit(target_ts, "error")
+                self._emit(target_ts, "error", note=str(exc))
+            else:
+                self._event("problem", message=str(exc))
             return EXIT_ERROR
         except KeyboardInterrupt:
             raise
@@ -494,7 +571,9 @@ class HedgeApp:
             log.exception("Unexpected error: %s", exc)
             self.notify(f"ERROR (unexpected): {exc}")
             if res is None:
-                self._emit(target_ts, "error")
+                self._emit(target_ts, "error", note=f"unexpected error: {exc}")
+            else:
+                self._event("problem", message=f"unexpected error: {exc}")
             return EXIT_ERROR
         finally:
             if res is not None and res.opened and not journaled:

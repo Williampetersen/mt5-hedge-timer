@@ -7,3 +7,8 @@ tzdata==2026.6
 ntplib==0.4.0
 requests==2.34.2
 pytest==9.2.0
+
+# The desktop app (aitrade): window, Windows password vault, the PC time zone.
+PySide6-Essentials==6.12.0
+keyring==25.7.0
+tzlocal==5.4.5

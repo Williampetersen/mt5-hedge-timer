@@ -13,13 +13,15 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Callable, Optional
 
+from . import terminal
 from . import trade_math as tm
-from .config import AppConfig
+from .config import ACCOUNT_CURRENCY, AppConfig
 
 log = logging.getLogger("hedgebot.mt5")
 
 RES_S_OK = 1  # MT5 last_error() code for "success"
 INIT_TIMEOUT_MS = 60_000
+FIRST_START_TIMEOUT_MS = 240_000  # a brand-new terminal unpacks and compiles its files before it answers
 
 
 class Mt5Error(RuntimeError):
@@ -116,7 +118,9 @@ class CloseInfo:
 
 
 class Mt5Client:
-    def __init__(self, cfg: AppConfig, *, clock, mt5=None, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, cfg: AppConfig, *, clock, mt5=None, sleep: Callable[[float], None] = time.sleep,
+                 launcher=None):
+        self.launcher = launcher if launcher is not None else terminal
         self.cfg = cfg
         self.clock = clock
         self.mt5 = mt5 if mt5 is not None else load_mt5_module()
@@ -167,33 +171,73 @@ class Mt5Client:
 
     # ------------------------------------------------------------------ connect
 
+    def _launch(self) -> "terminal.Launch":
+        """Start the terminal ourselves (Algo Trading on) when the config asks for it."""
+        a = self.cfg.account
+        if not a.launch:
+            return terminal.Launch(terminal.SKIPPED)
+        try:
+            return self.launcher.ensure_started(a.terminal_path, portable=a.portable, login=a.login,
+                                                server=a.server, password=self.cfg.password, sleep=self._sleep)
+        except Exception as exc:  # never let the helper stop a run: the package can still start the terminal
+            log.warning("Could not start MetaTrader 5 myself (%s); the Python package will start it", exc)
+            return terminal.Launch(terminal.FAILED)
+
+    def _algo_trading_off(self) -> bool:
+        info = self.mt5.terminal_info()
+        return info is not None and not info.trade_allowed
+
     def connect(self, attempts: int = 2) -> None:
         a = self.cfg.account
-        err = ""
-        for i in range(1, attempts + 1):
+        err, hint = "", ""
+        restarted = False
+        tries = 0
+        while tries < attempts:
+            tries += 1
+            launch = self._launch()
+            first = launch.status == terminal.FIRST_LOGIN
             ok = self.mt5.initialize(
                 a.terminal_path,
                 login=a.login,
                 password=self.cfg.password,
                 server=a.server,
                 portable=a.portable,
-                timeout=INIT_TIMEOUT_MS,
+                timeout=FIRST_START_TIMEOUT_MS if first else INIT_TIMEOUT_MS,
             )
             if ok:
+                if a.launch and not restarted and launch.status != terminal.SKIPPED and self._algo_trading_off():
+                    # It was already open with Algo Trading off (started by hand): start it again our way.
+                    restarted = True
+                    log.warning("Algo Trading is off in this MetaTrader 5; restarting it with Algo Trading on")
+                    try:
+                        self.mt5.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        self.launcher.close(a.terminal_path, sleep=self._sleep)
+                    except Exception as exc:
+                        log.warning("Could not close MetaTrader 5 (%s)", exc)
+                    tries -= 1
+                    continue
                 self.connected = True
                 return
             err = self._err()
+            if first or launch.dialog:
+                hint = (" MetaTrader 5 did not log in with this account number, password and server"
+                        + (f" (it showed the window '{launch.dialog}')" if launch.dialog else "") + ".")
             try:
                 self.mt5.shutdown()
             except Exception:
                 pass
-            if i < attempts:
+            if first and launch.dialog:
+                break  # the first login was refused: a second try with the same details cannot work
+            if tries < attempts:
                 log.warning("MT5 initialize failed (%s); retrying in 3 s", err)
                 self._sleep(3.0)
         raise Mt5Error(
-            f"Could not connect to MT5 at {a.terminal_path} as login {a.login} on {a.server}: {err}. "
-            "Check the password in .env, the exact server name from the MT5 login dialog, "
-            "and that you can log in manually in this terminal."
+            f"Could not connect to MT5 at {a.terminal_path} as login {a.login} on {a.server}: {err}.{hint} "
+            "Check the password, the exact server name from the MT5 login window, "
+            "and that you can log in by hand in this copy of MetaTrader 5."
         )
 
     def shutdown(self) -> None:
@@ -290,6 +334,7 @@ class Mt5Client:
             return points * info.point
         if money is None:
             return None
+        money = self.to_account_currency(money)  # tp_money/sl_money may be written in USD
         lots = self.cfg.trade.lots
         tick_size = info.trade_tick_size or info.point
         tv_key = "trade_tick_value_profit" if favourable else "trade_tick_value_loss"
@@ -322,6 +367,50 @@ class Mt5Client:
 
     def _currency(self) -> str:
         return getattr(self.account, "currency", "") or ""
+
+    def to_account_currency(self, amount: float) -> float:
+        """`amount` in trade.money_currency (e.g. USD) expressed in the account's currency.
+
+        Same currency (or money_currency: account) returns the amount unchanged.
+        Otherwise the broker's own exchange rate is used, e.g. EURUSD for a EUR
+        account: 150 USD / 1.25 = 120 EUR.
+        """
+        source = self.cfg.trade.money_currency
+        account = self._currency().upper()
+        if source == ACCOUNT_CURRENCY or not account or source == account:
+            return amount
+        rate = self._conversion_rate(source, account)
+        converted = amount * rate
+        log.info("%.2f %s = %.2f %s at the broker's rate %.6g", amount, source, converted, account, rate)
+        return converted
+
+    def _conversion_rate(self, source: str, account: str) -> float:
+        """How many units of `account` currency one unit of `source` currency is worth."""
+        try:
+            symbols = list(self.mt5.symbols_get() or ())
+        except Exception as exc:
+            raise PreflightError(f"Cannot convert {source} to {account}: {exc}") from None
+        direct, inverse = source + account, account + source  # e.g. USDJPY / EURUSD
+        found = []
+        for s in symbols:
+            name = str(getattr(s, "name", "")).upper()
+            base = str(getattr(s, "currency_base", "") or name[:3]).upper()
+            quote = str(getattr(s, "currency_profit", "") or name[3:6]).upper()
+            if name.startswith(direct) and (base, quote) == (source, account):
+                found.append((len(name), 0, s.name))
+            elif name.startswith(inverse) and (base, quote) == (account, source):
+                found.append((len(name), 1, s.name))
+        for _, inverted, name in sorted(found):  # shortest name first: EURUSD before EURUSD.m
+            self.mt5.symbol_select(name, True)
+            tick = self._wait_tick(name, timeout_s=2.0)
+            if tick is None:
+                continue
+            mid = (tick.bid + tick.ask) / 2.0
+            return 1.0 / mid if inverted else mid
+        raise PreflightError(
+            f"Cannot convert {source} to the account currency {account}: this broker has no "
+            f"{inverse} or {direct} price. Use an account in {source}, or set trade.money_currency: account."
+        )
 
     def preflight(self, *, strict_market: bool = True) -> Preflight:
         """All checks before arming. strict_market=False (used by --check) only warns
@@ -658,8 +747,12 @@ class Mt5Client:
         log.error(msg)
         return msg
 
-    def monitor(self, res: SendResult, until_ts: float, poll_s: float, *, log_every_s: float = 60.0) -> CloseInfo:
-        """Track floating P/L until the position closes or until_ts is reached."""
+    def monitor(self, res: SendResult, until_ts: float, poll_s: float, *, log_every_s: float = 60.0,
+                on_update: Optional[Callable[[float], None]] = None) -> CloseInfo:
+        """Track floating P/L until the position closes or until_ts is reached.
+
+        on_update(profit) is called on every poll while the position is open (for a live display).
+        """
         info = CloseInfo()
         ticket = res.position_ticket
         if ticket is None:
@@ -692,6 +785,11 @@ class Mt5Client:
                 info.last_profit = profit
                 info.max_favourable = max(info.max_favourable, profit)
                 info.max_adverse = min(info.max_adverse, profit)
+                if on_update is not None:
+                    try:
+                        on_update(profit)
+                    except Exception as exc:  # a display problem must never stop the monitor
+                        log.debug("on_update failed: %s", exc)
                 if now >= next_log:
                     log.info("Position #%s open: P/L %+.2f %s (max favourable %+.2f, max adverse %+.2f)",
                              ticket, profit, self._currency(), info.max_favourable, info.max_adverse)

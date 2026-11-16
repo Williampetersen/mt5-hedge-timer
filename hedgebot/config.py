@@ -36,16 +36,20 @@ _WEEKDAYS = {
     "sun": 6, "sunday": 6,
 }
 
+LOCAL_TIMEZONE = "local"  # schedule.timezone value meaning "the time zone of this PC"
+ACCOUNT_CURRENCY = "account"  # trade.money_currency value meaning "the account's own currency"
+
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})$")
+_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _KEYS = {
     "": {"name", "direction", "account", "trade", "schedule", "monitor"},
-    "account": {"login", "server", "password_env", "terminal_path", "portable", "allow_real_account"},
+    "account": {"login", "server", "password_env", "terminal_path", "portable", "allow_real_account", "launch"},
     "trade": {
-        "symbol", "lots", "tp_money", "tp_points", "sl_money", "sl_points", "deviation_points",
-        "magic", "comment", "max_spread_points", "check_margin",
+        "symbol", "lots", "tp_money", "tp_points", "sl_money", "sl_points", "money_currency",
+        "deviation_points", "magic", "comment", "max_spread_points", "check_margin",
     },
     "schedule": {
         "time", "timezone", "weekdays", "dates", "max_late_ms", "prearm_seconds",
@@ -75,6 +79,8 @@ class AccountConfig:
     terminal_path: str
     portable: bool = False
     allow_real_account: bool = False
+    # True: the engine starts the terminal itself, with Algo Trading on (see terminal.py).
+    launch: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,8 @@ class TradeConfig:
     comment: str
     max_spread_points: Optional[float]
     check_margin: bool
+    # Currency of tp_money / sl_money: "account" (the account's own currency) or a code like "USD".
+    money_currency: str = ACCOUNT_CURRENCY
 
     @property
     def has_tp(self) -> bool:
@@ -99,11 +107,15 @@ class TradeConfig:
     def has_sl(self) -> bool:
         return self.sl_money is not None or self.sl_points is not None
 
+    def money_label(self, account_currency: str = "") -> str:
+        """Currency the money amounts are written in ('USD', or the account's currency)."""
+        return account_currency if self.money_currency == ACCOUNT_CURRENCY else self.money_currency
+
     def describe_tp(self, currency: str = "") -> str:
-        return _describe_level(self.tp_money, self.tp_points, currency)
+        return _describe_level(self.tp_money, self.tp_points, self.money_label(currency))
 
     def describe_sl(self, currency: str = "") -> str:
-        return _describe_level(self.sl_money, self.sl_points, currency)
+        return _describe_level(self.sl_money, self.sl_points, self.money_label(currency))
 
 
 def _describe_level(money: Optional[float], points: Optional[float], currency: str) -> str:
@@ -161,6 +173,26 @@ class AppConfig:
     @property
     def is_buy(self) -> bool:
         return self.direction == "buy"
+
+
+# --------------------------------------------------------------------------- local time zone
+
+
+def local_timezone_name() -> str:
+    """IANA name of this PC's time zone (e.g. 'Europe/Copenhagen'), from the Windows setting.
+
+    Used for schedule.timezone: local. Raises LookupError when it cannot be found.
+    """
+    try:
+        from tzlocal import get_localzone_name
+
+        name = get_localzone_name()
+    except Exception as exc:
+        raise LookupError(f"could not read this PC's time zone: {exc}") from exc
+    if not name:
+        raise LookupError("this PC's time zone has no IANA name")
+    ZoneInfo(name)  # raises if tzdata does not know it
+    return name
 
 
 # --------------------------------------------------------------------------- loading
@@ -248,6 +280,7 @@ def parse_config(
     terminal_path = v.string(acc, "account", "terminal_path")
     portable = v.boolean(acc, "account", "portable", default=False)
     allow_real = v.boolean(acc, "account", "allow_real_account", default=False)
+    launch = v.boolean(acc, "account", "launch", default=False)
 
     password = ""
     if password_env is not None:
@@ -275,6 +308,14 @@ def parse_config(
         v.err("use only one of 'trade.tp_money' and 'trade.tp_points' (set the other to null)")
     if sl_money is not None and sl_points is not None:
         v.err("use only one of 'trade.sl_money' and 'trade.sl_points' (set the other to null)")
+    money_ccy = v.string(tr, "trade", "money_currency", default=ACCOUNT_CURRENCY)
+    if money_ccy is not None:
+        if money_ccy.lower() == ACCOUNT_CURRENCY:
+            money_ccy = ACCOUNT_CURRENCY
+        elif _CURRENCY_RE.match(money_ccy.upper()):
+            money_ccy = money_ccy.upper()
+        else:
+            v.err(f"'trade.money_currency' must be 'account' or a 3-letter code like USD (got {money_ccy!r})")
     deviation = v.integer(tr, "trade", "deviation_points", minimum=0)
     magic = v.integer(tr, "trade", "magic", minimum=0, maximum=2**63 - 1)
     comment = v.string(tr, "trade", "comment", allow_empty=True)
@@ -287,6 +328,13 @@ def parse_config(
     sc = v.section(raw, "schedule")
     at = v.time_of_day(sc, "schedule", "time")
     tz_name = v.string(sc, "schedule", "timezone")
+    if tz_name is not None and tz_name.lower() == LOCAL_TIMEZONE:
+        try:
+            tz_name = local_timezone_name()
+        except (LookupError, ZoneInfoNotFoundError, ValueError) as exc:
+            v.err(f"'schedule.timezone' is 'local' but {exc}; write the zone name instead, "
+                  "e.g. Europe/Copenhagen")
+            tz_name = None
     if tz_name is not None:
         try:
             ZoneInfo(tz_name)
@@ -332,13 +380,14 @@ def parse_config(
         direction=direction,
         account=AccountConfig(
             login=login, server=server, password_env=password_env, terminal_path=terminal_path,
-            portable=portable, allow_real_account=allow_real,
+            portable=portable, allow_real_account=allow_real, launch=bool(launch),
         ),
         trade=TradeConfig(
             symbol=symbol, lots=float(lots),
             tp_money=_f(tp_money), tp_points=_f(tp_points), sl_money=_f(sl_money), sl_points=_f(sl_points),
             deviation_points=deviation, magic=magic, comment=comment,
             max_spread_points=_f(max_spread), check_margin=check_margin,
+            money_currency=money_ccy or ACCOUNT_CURRENCY,
         ),
         schedule=ScheduleConfig(
             time=at, timezone=tz_name, weekdays=weekdays, dates=dates, max_late_ms=max_late_ms,

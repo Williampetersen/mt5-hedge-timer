@@ -119,9 +119,9 @@ def test_trade_is_journaled_before_monitoring(buy_cfg, tmp_path):
     seen = {}
     real_monitor = Mt5Client.monitor
 
-    def monitor(self, res, until, poll):
+    def monitor(self, res, until, poll, **kwargs):
         seen["rows"] = journal.rows()  # what a killed process would leave behind
-        return real_monitor(self, res, clock.t + 3, poll)
+        return real_monitor(self, res, clock.t + 3, poll, **kwargs)
 
     Mt5Client.monitor = monitor
     try:

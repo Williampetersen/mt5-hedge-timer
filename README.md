@@ -1,5 +1,77 @@
 # MT5 Hedge Timer
 
+## Aitrade: the app window
+
+Double-click **`Aitrade.bat`** to open the app. It is a window around the same
+engine that the rest of this file describes, so no config files and no command
+line are needed.
+
+- **First start: a setup in four steps.** The BUY account, the SELL account
+  (broker, server, account number, password, demo or real, symbol, and which
+  MetaTrader 5 copy to use), the trade (lot size, take profit in USD, optional
+  stop loss in USD, date and time), and a check of everything.
+- **Every day after:** confirm lot size, take profit, date and time
+  (`HH:MM:SS`), then press **Run**. With more than two minutes to go, both
+  accounts are tested first (MetaTrader 5 opens and logs in). Then the app
+  counts down, opens both positions at the set second, and shows the fill, the
+  take profit and the profit of each side until it closes.
+- **Date and time are the PC's own time.** The PC clock is compared with
+  internet time and corrected, so the positions open at the true time.
+- **Take profit and stop loss are in USD**, also on an account in another
+  currency (the broker's own exchange rate is used).
+- **Passwords** are kept in the Windows password vault (Credential Manager,
+  entries named "Aitrade MT5"), never in a file.
+- **Check accounts** tests everything and sends nothing. **Practice run** does
+  a full run 60 seconds later, but the order is only checked by the broker.
+- Settings, logs and the trade journal are in the folder `Aitrade` inside
+  `%LOCALAPPDATA%` ("Open the log folder" in the app).
+
+### MetaTrader 5 is set up by the app
+
+MetaTrader 5 runs one account per program folder, so two accounts need two
+folders. The last setup step ("Install and check") does this by itself:
+
+- It takes the MetaTrader 5 that is installed on the PC, or downloads the
+  official installer from MetaQuotes when there is none (the installer's
+  MetaQuotes signature is checked before it is started; Windows asks for
+  permission once).
+- It copies the program files into two folders of its own, `buy` and `sell`,
+  and runs them in portable mode, so all their data stays in those folders.
+  Saved accounts, settings, logs and price history of the original are never
+  copied. The original MetaTrader is not changed.
+- The folder for the copies is `mt5` inside the app's data folder. When the
+  Windows drive has less than 10 GB free, it is `AitradeMT5` on the drive the
+  app is on. Set `AITRADE_MT5_DIR` to choose it yourself.
+- Before every check and run, the engine starts each MetaTrader itself with a
+  small start-up file (`/config`), which switches **Algo Trading on**. A
+  MetaTrader that was opened by hand (Algo Trading off) is restarted that way.
+- **First login of a new copy:** a MetaTrader that has never logged in shows
+  its "Open an Account" window, and the Python connection cannot get through
+  it. So for that one start only, the account number, password and server are
+  put into the start-up file (in the user's private temp folder) and the file
+  is overwritten and deleted a few seconds later. After that the password is
+  only ever passed in memory.
+- "MetaTrader 5 for this account" can also point to a MetaTrader you installed
+  yourself (for example your broker's own). Log into the account in it once by
+  hand; Aitrade never writes a password file for it.
+
+The first start of a new MetaTrader 5 copy can take a few minutes (it unpacks
+and compiles its standard programs). Set `HEDGEBOT_LAUNCH=0` to switch the
+start-up file off and let the Python package start MetaTrader as before.
+
+First time on a PC: install Python (step 1 below) and run the setup script
+once (step 5). Steps 3 and 4 (installing MetaTrader twice, logging in by hand,
+turning on Algo Trading) are only needed when you use the engine without the
+app.
+
+Code: `aitrade/` is the app, `hedgebot/` is the engine. Run the tests with
+`python -m pytest` from the `.venv`. The script `scripts/ui_snapshot.py` draws
+every screen against a pretend broker (add `--live`), so no MT5 is needed.
+
+---
+
+## The engine on its own (command line)
+
 Two small apps that open opposite positions **in the same second** on two
 separate MetaTrader 5 accounts:
 

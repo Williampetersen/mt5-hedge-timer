@@ -42,6 +42,7 @@ MUST_MATCH: list[tuple[str, Callable[[AppConfig], Any]]] = [
     ("trade.tp_points", lambda c: c.trade.tp_points),
     ("trade.sl_money", lambda c: c.trade.sl_money),
     ("trade.sl_points", lambda c: c.trade.sl_points),
+    ("trade.money_currency", lambda c: c.trade.money_currency),
     ("schedule.time", lambda c: c.schedule.time.isoformat()),
     ("schedule.timezone", lambda c: c.schedule.timezone),
     ("schedule.weekdays", lambda c: tuple(WEEKDAY_ABBR[d] for d in c.schedule.weekdays)),
@@ -59,8 +60,12 @@ SHOULD_MATCH: list[tuple[str, Callable[[AppConfig], Any]]] = [
 ]
 
 
-def validate_pair(buy: AppConfig, sell: AppConfig) -> tuple[list[str], list[str]]:
-    """Returns (errors, warnings). Any error means: do not start."""
+def validate_pair(buy: AppConfig, sell: AppConfig, *, same_symbol: bool = True) -> tuple[list[str], list[str]]:
+    """Returns (errors, warnings). Any error means: do not start.
+
+    same_symbol=False allows a different symbol name on each account (two brokers
+    often name the same market differently, e.g. XAUUSD and GOLD); it becomes a warning.
+    """
     errors: list[str] = []
     warnings: list[str] = []
     if buy.direction != "buy":
@@ -73,6 +78,10 @@ def validate_pair(buy: AppConfig, sell: AppConfig) -> tuple[list[str], list[str]
     for label, get in MUST_MATCH:
         a, b = get(buy), get(sell)
         if not _same(a, b):
+            if label == "trade.symbol" and not same_symbol:
+                warnings.append(f"the symbol name differs: buy={_show(a)} sell={_show(b)} "
+                                "(fine if both names are the same market at two brokers)")
+                continue
             errors.append(f"{label} differs: buy={_show(a)} sell={_show(b)} (must be the same in both files)")
     if buy.account.login == sell.account.login:
         errors.append(f"both configs use login {buy.account.login}; each app needs its own account")

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hedgebot.__main__ import CHILD_ENV, RESULT_PREFIX  # noqa: E402
+from hedgebot.__main__ import CHILD_ENV, EVENT_PREFIX, RESULT_PREFIX  # noqa: E402
 from hedgebot.config import ConfigError, load_config  # noqa: E402
 from hedgebot.pair import validate_pair  # noqa: E402
 
@@ -115,6 +115,8 @@ class PairRunner:
         assert proc.stdout is not None
         for raw in iter(proc.stdout.readline, ""):
             line = raw.rstrip("\r\n")
+            if line.startswith(EVENT_PREFIX):
+                continue  # progress lines are for the desktop app, not for the console
             result = parse_result_line(line)
             if result is None:
                 self.out(f"[{label}] {line}")
