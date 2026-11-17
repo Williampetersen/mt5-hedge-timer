@@ -26,6 +26,40 @@ line are needed.
 - Settings, logs and the trade journal are in the folder `Aitrade` inside
   `%LOCALAPPDATA%` ("Open the log folder" in the app).
 
+### Install Aitrade like a normal program
+
+`Aitrade-Setup-<version>.exe` installs Aitrade for the current Windows user.
+No administrator rights are needed, and Python does not have to be on the PC.
+
+- It puts the program in a folder, makes a Start-menu and a Desktop shortcut,
+  and adds Aitrade to "Installed apps" in Windows.
+- Folder: `Programs\Aitrade` inside `%LOCALAPPDATA%`. When the Windows drive
+  has less than 10 GB free and the setup file is on another drive, it proposes
+  `AitradeApp` on that drive. The folder can be changed in the setup window.
+- Running a newer setup file updates the program where it is. Settings, saved
+  passwords, logs and the MetaTrader copies are not in the program folder, so
+  they are kept.
+- Remove it in Windows Settings, Apps, Installed apps, Aitrade, Uninstall.
+  Only the files the setup wrote are deleted, never a whole folder.
+- Windows may say "Windows protected your PC" (unknown publisher), because
+  the setup file is not signed. Choose "More info", then "Run anyway".
+- For scripts: `Aitrade-Setup.exe --silent [--dir FOLDER] [--no-desktop]`
+  (exit code 0 = installed; the log is `Aitrade-Setup.log` in `%TEMP%`).
+- `Aitrade.exe --selftest report.json` checks that the installed program is
+  complete (window, time zone, password vault, MetaTrader package, engine
+  program) without touching any account.
+
+Build the setup file from the source code (result in `dist\`):
+
+```powershell
+.venv\Scripts\python.exe packaging\build.py
+```
+
+The installed program is two programs in one folder: `Aitrade.exe` (the
+window) and `aitrade-worker.exe` (the engine; the window starts one per
+account, hidden). The setup file is a small program of its own
+(`packaging\setup_main.py`) that carries the program folder as a zip inside.
+
 ### MetaTrader 5 is set up by the app
 
 MetaTrader 5 runs one account per program folder, so two accounts need two

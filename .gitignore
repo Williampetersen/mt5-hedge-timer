@@ -17,3 +17,8 @@ snapshots/
 
 # Compiled MQL5
 *.ex5
+
+# Build output (packaging/build.py)
+build-tmp/
+dist/
+packaging/icon-preview.png

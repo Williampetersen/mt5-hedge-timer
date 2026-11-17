@@ -44,9 +44,16 @@ def test_run_and_practice_pass_one_shared_utc_target():
     assert practice[-3:] == ["--target-at", "2026-12-04T13:29:45+00:00", "--dry-run"]
 
 
-def test_installed_app_starts_itself_as_worker():
-    cmd = r.worker_command(Path("buy.yaml"), mode=r.MODE_CHECK, frozen=True, executable="C:\\A\\Aitrade.exe", **KW)
-    assert cmd[:2] == ["C:\\A\\Aitrade.exe", "worker"] and "-m" not in cmd
+def test_installed_app_starts_its_engine_program(tmp_path):
+    exe = tmp_path / "Aitrade.exe"
+    exe.write_bytes(b"")
+    # without the engine program next to it, the window program can do the job itself
+    cmd = r.worker_command(Path("buy.yaml"), mode=r.MODE_CHECK, frozen=True, executable=str(exe), **KW)
+    assert cmd[:2] == [str(exe), "worker"] and "-m" not in cmd
+    worker = tmp_path / r.WORKER_PROGRAM
+    worker.write_bytes(b"")
+    cmd = r.worker_command(Path("buy.yaml"), mode=r.MODE_CHECK, frozen=True, executable=str(exe), **KW)
+    assert cmd[0] == str(worker) and cmd[1] == "--config" and "worker" not in cmd[1:]
 
 
 def test_windowless_python_is_swapped_for_the_console_one():

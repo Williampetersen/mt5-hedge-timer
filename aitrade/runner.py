@@ -20,6 +20,7 @@ from hedgebot.__main__ import CHILD_ENV, EVENT_PREFIX, RESULT_PREFIX
 
 from .engine_config import PASSWORD_ENV
 
+WORKER_PROGRAM = "aitrade-worker.exe"
 MODE_CHECK = "check"  # connect and test everything, send nothing
 MODE_RUN = "run"  # wait for the time and open the position
 MODE_PRACTICE = "practice"  # like run, but the order is only checked by the broker, not placed
@@ -59,7 +60,12 @@ def worker_command(
     exe = executable or sys.executable
     if not frozen and os.path.basename(exe).lower() == "pythonw.exe":
         exe = os.path.join(os.path.dirname(exe), "python.exe")  # the worker prints; pythonw cannot
-    cmd = [exe, "worker"] if frozen else [exe, "-u", "-m", "aitrade", "worker"]
+    if frozen:
+        # The installed program has a second, console-type program for the engine (it can print).
+        worker = os.path.join(os.path.dirname(exe), WORKER_PROGRAM)
+        cmd = [worker] if os.path.isfile(worker) else [exe, "worker"]
+    else:
+        cmd = [exe, "-u", "-m", "aitrade", "worker"]
     cmd += ["--config", str(config_path), "--log-dir", str(log_dir), "--journal", str(journal)]
     if mode == MODE_CHECK:
         cmd.append("--check")

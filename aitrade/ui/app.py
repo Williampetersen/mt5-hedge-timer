@@ -10,6 +10,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -206,6 +207,8 @@ def create_app(argv: Optional[list[str]] = None) -> QApplication:
     app = QApplication.instance() or QApplication([APP_NAME, *(argv or [])])
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
+    if paths.icon_file().is_file():
+        app.setWindowIcon(QIcon(str(paths.icon_file())))
     theme.apply(app)
     return app
 

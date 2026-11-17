@@ -8,6 +8,7 @@ the program folder itself never changes. Set AITRADE_HOME to use another folder
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 HOME_ENV = "AITRADE_HOME"
@@ -44,6 +45,22 @@ def journal_file() -> Path:
     return data_dir() / "journal.csv"
 
 
-def project_root() -> Path:
-    """Folder that holds the `aitrade` and `hedgebot` packages (the working folder for workers)."""
+def is_installed_program() -> bool:
+    """True when this is the installed Windows program (built with PyInstaller), not the source code."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir() -> Path:
+    """Folder the program runs from: the install folder, or the source folder during development."""
+    if is_installed_program():
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+def project_root() -> Path:
+    """The working folder for the engine processes (same as app_dir)."""
+    return app_dir()
+
+
+def icon_file() -> Path:
+    return Path(__file__).resolve().parent / "aitrade.ico"

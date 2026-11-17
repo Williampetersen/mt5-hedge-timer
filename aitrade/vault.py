@@ -7,6 +7,7 @@ Manager > Windows Credentials under "Aitrade MT5".
 
 from __future__ import annotations
 
+import sys
 from typing import Optional
 
 SERVICE = "Aitrade MT5"
@@ -32,6 +33,14 @@ class Vault:
                 import keyring
             except ImportError as exc:
                 raise VaultError("The 'keyring' package is missing, so passwords cannot be saved.") from exc
+            if sys.platform == "win32":
+                # Name the Windows vault outright: the installed program cannot search for back ends.
+                try:
+                    from keyring.backends.Windows import WinVaultKeyring
+
+                    keyring.set_keyring(WinVaultKeyring())
+                except Exception as exc:
+                    raise VaultError(f"The Windows password vault is not available: {exc}") from exc
             self._backend = keyring
         return self._backend
 

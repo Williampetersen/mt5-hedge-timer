@@ -37,8 +37,8 @@ def load_mt5_module():
         import MetaTrader5 as mt5  # type: ignore
     except ImportError as exc:
         raise Mt5Error(
-            "The MetaTrader5 Python package is not installed in this environment "
-            "(it exists only for Windows). Run scripts\\setup.ps1."
+            f"The MetaTrader5 Python package could not be loaded ({exc}). It exists only for Windows. "
+            "Install Aitrade again, or run scripts\\setup.ps1 when working from the source code."
         ) from exc
     return mt5
 
