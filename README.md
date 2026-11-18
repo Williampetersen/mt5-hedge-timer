@@ -1,5 +1,8 @@
 # MT5 Hedge Timer
 
+**Download:** the ready-made setup file for Windows is in the [`download`](download/) folder
+(`Aitrade-Setup-<version>.exe`). Take the file with the highest version number.
+
 ## Aitrade: the app window
 
 Double-click **`Aitrade.bat`** to open the app. It is a window around the same
@@ -69,6 +72,11 @@ Build the setup file from the source code (result in `dist\`):
 ```powershell
 .venv\Scripts\python.exe packaging\build.py
 ```
+
+GitHub builds it as well (`.github/workflows/build-installer.yml`): after a change on
+`main` it runs all tests on Windows, builds the setup file, installs it and runs the
+self-test of the installed program. When the version number in `aitrade/__init__.py`
+is new, the setup file is then put in the [`download`](download/) folder.
 
 The installed program is two programs in one folder: `Aitrade.exe` (the
 window) and `aitrade-worker.exe` (the engine; the window starts one per

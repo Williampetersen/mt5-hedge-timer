@@ -1,0 +1,127 @@
+# Builds Aitrade-Setup-<version>.exe on a Windows machine at GitHub and puts it in the
+# "download" folder of this repository, so nobody has to build anything on their own PC.
+#
+# It runs on every change of the program on the main branch: all tests, the build, an
+# install of the built setup file and the self-test of the installed program. A setup
+# file is only added to "download" when there is none for this version number yet
+# (aitrade/__init__.py). To replace an existing one, start this workflow by hand:
+# Actions > Build the Aitrade setup file > Run workflow.
+name: Build the Aitrade setup file
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "aitrade/**"
+      - "hedgebot/**"
+      - "packaging/**"
+      - "tests/**"
+      - "run_pair.py"
+      - "requirements.txt"
+      - ".github/workflows/build-installer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-installer
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Test, build and publish
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the pinned packages
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Read the version number
+        id: version
+        run: |
+          version=$(python -c "import aitrade; print(aitrade.__version__)" | tr -d '\r')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "file=Aitrade-Setup-$version.exe" >> "$GITHUB_OUTPUT"
+
+      - name: Run all tests
+        run: |
+          set -o pipefail
+          python -m pytest -rfE 2>&1 | tee pytest-output.txt
+
+      - name: Build the setup file
+        run: python packaging/build.py --work "$RUNNER_TEMP/aitrade-build" --out dist
+
+      - name: Install it and run the self-test of the installed program
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist\${{ steps.version.outputs.file }}"
+          $target = Join-Path $env:RUNNER_TEMP "aitrade-installed"
+          $log = Join-Path $env:RUNNER_TEMP "Aitrade-Setup.log"
+          $report = Join-Path $env:RUNNER_TEMP "selftest.json"
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList `
+            "--silent", "--dir", $target, "--no-desktop", "--no-shortcuts", "--no-register", "--log", $log
+          Get-Content $log -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "The setup file did not install (exit code $($p.ExitCode))." }
+          $p = Start-Process -FilePath (Join-Path $target "Aitrade.exe") -Wait -PassThru -ArgumentList "--selftest", $report
+          Get-Content $report -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "The self-test of the installed program failed (exit code $($p.ExitCode))." }
+
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo "## Aitrade ${{ steps.version.outputs.version }}"
+            echo
+            echo "### Tests"
+            echo '```'
+            tail -n 40 pytest-output.txt 2>/dev/null || echo "(the tests did not run)"
+            echo '```'
+            echo "### Self-test of the installed program"
+            echo '```json'
+            cat "$RUNNER_TEMP/selftest.json" 2>/dev/null || echo "(not run)"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Put the setup file in the download folder
+        if: github.ref == 'refs/heads/main'
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          file="${{ steps.version.outputs.file }}"
+          if [ -f "download/$file" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "download/$file is already there, so it was left as it is. For a new file, change the version" \
+                 "number in aitrade/__init__.py, or start this workflow by hand to replace it." \
+                 | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          size=$(stat -c %s "dist/$file")
+          if [ "$size" -gt 99000000 ]; then
+            echo "The setup file is $size bytes: too big for a file in a GitHub repository (the limit is 100 MB)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir -p download
+          cp "dist/$file" "download/$file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "download/$file"
+          if git diff --cached --quiet; then
+            echo "download/$file did not change." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "Aitrade-Setup $version for download (built from ${GITHUB_SHA::7})"
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+          echo "### Published: download/$file ($((size / 1024 / 1024)) MB)" >> "$GITHUB_STEP_SUMMARY"
