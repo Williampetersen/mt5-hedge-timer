@@ -1,13 +1,16 @@
-"""The everyday screen: confirm lot size, take profit, date and time, then press Run."""
+"""The everyday screen: confirm lot size, take profit, date and time, then press Run.
+
+Run starts both accounts at once: MetaTrader 5 opens, logs in and every check
+runs right away, long before the time. There is no limit on runs per day.
+"""
 
 from __future__ import annotations
 
 import html
-import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Mapping, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -15,7 +18,7 @@ from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QPlainTextEdit, QVBoxLay
 
 from .. import describe, paths
 from ..mt5_setup import missing_copy_problems
-from ..runner import CHECK_OK, MODE_CHECK, MODE_PRACTICE, MODE_RUN, SideState, short_log
+from ..runner import MODE_CHECK, MODE_PRACTICE, MODE_RUN, SideState, pair_abort_reason, short_log
 from ..settings import SIDE_TITLES, SIDES, Settings, save, target_datetime, validate_accounts, validate_plan
 from ..vault import Vault
 from . import theme
@@ -25,29 +28,27 @@ from .session import PairSession
 from .side_card import SideCard
 from .widgets import Card, MessageBox, button, label, row, set_kind
 
-PRECHECK_MIN_LEAD_S = 120  # with more time than this left, Run tests both accounts first
 PRACTICE_LEAD_S = 60
 MIN_LEAD_S = 5
 LOG_COLORS = {"WARNING": theme.WARN, "ERROR": theme.SELL, "CRITICAL": theme.SELL}
 
-IDLE, PRECHECK, CHECK, RUN, PRACTICE = "idle", "precheck", "check", "run", "practice"
+IDLE, CHECK, RUN, PRACTICE = "idle", "check", "run", "practice"
 
 
 class RunPage(QWidget):
     edit_settings = Signal()
 
     def __init__(self, settings: Settings, vault: Vault, *, tz, zone_label: str = "",
-                 clock_offset: Callable[[], float] = lambda: 0.0, parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("page")
         self.settings = settings
         self.vault = vault
         self.tz = tz
-        self._clock_offset = clock_offset
         self.session: Optional[PairSession] = None
         self.phase = IDLE
         self._shown_mode = MODE_RUN
-        self._pending: Optional[tuple[datetime, Mapping[str, Path], dict[str, str]]] = None
+        self._pair_stopped = False  # this run was stopped as a whole because one side failed
 
         # ---- left: the plan and the buttons
         self.plan_form = PlanForm(zone_label)
@@ -115,7 +116,7 @@ class RunPage(QWidget):
         self.plan_form.changed.connect(self._refresh)
         self._timer = QTimer(self)
         self._timer.setInterval(250)
-        self._timer.timeout.connect(self._refresh)
+        self._timer.timeout.connect(self._tick)
         self._timer.start()
         self.reload_accounts()
         self._refresh()
@@ -123,8 +124,8 @@ class RunPage(QWidget):
     # ------------------------------------------------------------ helpers
 
     def now(self) -> datetime:
-        """The true time (PC clock corrected with internet time), in the PC's time zone."""
-        return datetime.fromtimestamp(time.time() + self._clock_offset(), self.tz)
+        """This PC's own clock, in the PC's time zone: the clock that decides when the positions open."""
+        return datetime.fromtimestamp(time.time(), self.tz)
 
     @property
     def active(self) -> bool:
@@ -190,7 +191,7 @@ class RunPage(QWidget):
             target = target_datetime(plan, self.tz)
             lead = (target - self.now()).total_seconds()
             if lead < MIN_LEAD_S:
-                self.errors.show_lines([f"{plan.date} {plan.time} has already passed. Choose a later time."])
+                self.errors.show_lines([self._too_close_text(plan, lead)])
                 return
         elif mode == MODE_PRACTICE:
             target = self.now() + timedelta(seconds=PRACTICE_LEAD_S)
@@ -202,17 +203,27 @@ class RunPage(QWidget):
             self.errors.show_lines(exc.lines)
             return
 
-        if mode == MODE_RUN and not self._confirm_real(plan, target):
-            return
+        if mode == MODE_RUN:
+            if not self._confirm_real(plan, target):
+                return
+            # The question may have stayed open for a while: both sides still need time to get ready.
+            lead = (target - self.now()).total_seconds()
+            if lead < MIN_LEAD_S:
+                self.errors.show_lines([self._too_close_text(plan, lead)])
+                return
 
         self.log.clear()
-        if mode == MODE_RUN and lead > PRECHECK_MIN_LEAD_S:
-            self._pending = (target, config_paths, passwords)
-            self._note("Testing both accounts before waiting")
-            self._begin(MODE_CHECK, PRECHECK, config_paths, passwords, None)
-        else:
-            self._begin(mode, {MODE_RUN: RUN, MODE_PRACTICE: PRACTICE, MODE_CHECK: CHECK}[mode],
-                        config_paths, passwords, target)
+        if mode != MODE_CHECK:
+            self._note("Starting both accounts and checking everything now")
+        self._begin(mode, {MODE_RUN: RUN, MODE_PRACTICE: PRACTICE, MODE_CHECK: CHECK}[mode],
+                    config_paths, passwords, target)
+
+    @staticmethod
+    def _too_close_text(plan, lead: float) -> str:
+        if lead <= 0:
+            return f"{plan.date} {plan.time} has already passed. Choose a later time."
+        return (f"{plan.date} {plan.time} is less than {MIN_LEAD_S} seconds away, too soon for both "
+                "accounts to get ready. Choose a later time.")
 
     def _confirm_real(self, plan, target: datetime) -> bool:
         real = [s for s in SIDES if self.settings.account(s).real]
@@ -232,8 +243,9 @@ class RunPage(QWidget):
                target: Optional[datetime]) -> None:
         self.phase = phase
         self._shown_mode = mode
+        self._pair_stopped = False
         session = PairSession(mode, config_paths, passwords, target=target, parent=self)
-        session.changed.connect(self._refresh)
+        session.changed.connect(self._tick)
         session.line.connect(self._append_log)
         session.finished.connect(self._session_finished)
         self.session = session
@@ -256,32 +268,34 @@ class RunPage(QWidget):
         self.stop()
 
     def stop(self) -> None:
-        self._pending = None
         if self.session is not None:
             self.session.stop()
 
+    def _tick(self) -> None:
+        """Four times a second, and whenever a side changes: keep the pair together, then redraw."""
+        self._stop_pair_if_needed()
+        self._refresh()
+
+    def _stop_pair_if_needed(self) -> None:
+        """Both sides or none: stop the run as a whole when one side cannot open (see pair_abort_reason)."""
+        session = self.session
+        if session is None or session.target is None or not session.active:
+            return
+        left = (session.target - self.now()).total_seconds()
+        reason = pair_abort_reason(session.states["buy"], session.states["sell"], left)
+        if not reason:
+            return
+        if not self._pair_stopped:  # say it once ...
+            self._pair_stopped = True
+            self._note(reason)
+            self.errors.show_lines([reason])
+        # ... but stop again as long as a side is still waiting (one that had not started yet the first time)
+        session.stop()
+        for state in session.states.values():
+            if state.stop_requested:
+                state.stopped_before_time = True  # at least a second before the time: it sent nothing
+
     def _session_finished(self) -> None:
-        session, pending = self.session, self._pending
-        self._pending = None
-        if self.phase == PRECHECK and session is not None and pending is not None:
-            states = session.states
-            skip = [f"{SIDE_TITLES[s]}: {states[s].snapshot.get('skip_reason')}" for s in SIDES
-                    if states[s].snapshot.get("skip_reason")]
-            if all(states[s].state == CHECK_OK for s in SIDES) and not skip:
-                target, config_paths, passwords = pending
-                if (target - self.now()).total_seconds() < MIN_LEAD_S:
-                    self.errors.show_lines(["The test took too long and the time has passed. "
-                                            "Choose a later time and press Run again."])
-                else:
-                    self._note("Both accounts are ready. Waiting for the time")
-                    self._begin(MODE_RUN, RUN, config_paths, passwords, target)
-                    return
-            elif skip:
-                self.errors.show_lines(["The run would be skipped, so it was not started:"] + skip
-                                       + ["Close that position in MetaTrader 5 first, then press Run again."])
-            else:
-                self.errors.show_lines(["The run was not started because the test failed. "
-                                        "Fix the red text on the right, then press Run again."])
         self.phase = IDLE
         self._refresh()
 
@@ -294,7 +308,7 @@ class RunPage(QWidget):
         target = target_datetime(plan, self.tz)
         left = (target - self.now()).total_seconds()
         if left < MIN_LEAD_S:
-            return "Ready", f"{plan.date} {plan.time} has already passed. Choose a later time.", describe.WARN
+            return "Ready", self._too_close_text(plan, left), describe.WARN
         return ("Ready", f"Run opens both positions at {plan.date} {plan.time} – "
                          f"in {describe.countdown(left)}.", describe.MUTED)
 
@@ -309,10 +323,10 @@ class RunPage(QWidget):
                 left = (self.session.target - self.now()).total_seconds()
             head, sub, tone = describe.overall(self._shown_mode, states["buy"], states["sell"],
                                                seconds_left=left, active=active)
-            if self.phase == PRECHECK and active:
-                sub = "Testing both accounts first. Then the app waits for the time."
-            elif self.phase in (RUN, PRACTICE) and active and left is not None and left > 0 and not sub:
-                sub = f"at {self.session.target:%Y-%m-%d %H:%M:%S} on this PC's clock. Keep the PC on."
+            if self.phase in (RUN, PRACTICE) and active and left is not None and left > 0 \
+                    and tone == describe.INFO:
+                stamp = f"{self.session.target:%Y-%m-%d %H:%M:%S} on this PC's clock. Keep the PC on."
+                sub = f"{sub} Set for {stamp}" if sub else f"at {stamp}"
             elif not active and head == "Ready":
                 head, sub, tone = self._idle_text()
         self.headline.setText(head)

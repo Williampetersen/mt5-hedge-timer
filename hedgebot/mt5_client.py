@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date
 from typing import Callable, Optional
 
 from . import terminal
@@ -22,6 +21,7 @@ log = logging.getLogger("hedgebot.mt5")
 RES_S_OK = 1  # MT5 last_error() code for "success"
 INIT_TIMEOUT_MS = 60_000
 FIRST_START_TIMEOUT_MS = 240_000  # a brand-new terminal unpacks and compiles its files before it answers
+MARKET_SETTLE_S = 5.0  # a terminal that has only just started still shows old prices for a moment
 
 
 class Mt5Error(RuntimeError):
@@ -66,7 +66,6 @@ class Preflight:
     margin_required: Optional[float]
     margin_free: float
     margin_warning: Optional[str]
-    server_offset_s: int
     account_kind: str
     hedging: bool
 
@@ -79,7 +78,7 @@ class Preflight:
 class SendResult:
     status: str = "pending"  # opened | dry_run | failed | skipped_late | skipped_spread
     target_ts: float = 0.0
-    send_ts: Optional[float] = None  # NTP-corrected clock
+    send_ts: Optional[float] = None  # the app's clock: the PC clock, plus the NTP correction when that is on
     send_pc_ts: Optional[float] = None  # raw PC clock (to compare the two apps on one PC)
     deviation_ms: Optional[float] = None
     latency_ms: Optional[float] = None
@@ -130,6 +129,8 @@ class Mt5Client:
         self.terminal = None
         self.info = None  # symbol_info from preflight
         self.last_tick = None
+        # Tickets of our positions that were open before the send (earlier runs may still be open).
+        self._known_tickets: frozenset[int] = frozenset()
 
     @property
     def direction(self) -> str:
@@ -301,12 +302,12 @@ class Mt5Client:
     # ------------------------------------------------------------------ preflight
 
     def _wait_tick(self, symbol: str, timeout_s: float = 3.0):
-        deadline = time.monotonic() + timeout_s
+        deadline = self.clock.time() + timeout_s
         while True:
             tick = self.mt5.symbol_info_tick(symbol)
             if tick is not None and tick.bid > 0 and tick.ask > 0:
                 return tick
-            if time.monotonic() >= deadline:
+            if self.clock.time() >= deadline:
                 return None
             self._sleep(0.1)
 
@@ -326,6 +327,23 @@ class Mt5Client:
             log.debug("symbols_get failed: %s", exc)
             times = []
         return max(times + [fallback])
+
+    def _market_closed(self, sym: str, tick) -> tuple:
+        """(newest tick, why the market looks closed or None).
+
+        A terminal that has only just started still holds the prices of its last
+        session for a moment, so a "closed" verdict is given a few seconds to clear.
+        """
+        deadline = self.clock.time() + MARKET_SETTLE_S
+        while True:
+            tick_ts = getattr(tick, "time_msc", 0) / 1000.0 or float(tick.time)
+            closed = tm.market_closed_reason(sym, tick_ts, self._freshest_quote_ts(tick_ts), self.clock.time())
+            if closed is None or self.clock.time() >= deadline:
+                return tick, closed
+            self._sleep(0.25)
+            newer = self.mt5.symbol_info_tick(sym)
+            if newer is not None and newer.bid > 0 and newer.ask > 0:
+                tick = newer
 
     def distance(self, money: Optional[float], points: Optional[float], price: float, info, *,
                  favourable: bool) -> Optional[float]:
@@ -434,17 +452,13 @@ class Mt5Client:
         tick = self._wait_tick(sym)
         if tick is None:
             raise PreflightError(f"No prices for {sym}: the market is closed or the symbol is not streaming.")
+        tick, closed = self._market_closed(sym, tick)
         self.last_tick = tick
-        tick_ts = getattr(tick, "time_msc", 0) / 1000.0 or float(tick.time)
-        server_offset, closed = tm.market_state(sym, tick_ts, self._freshest_quote_ts(tick_ts), self.clock.time())
         if closed:
             if strict_market:
                 raise PreflightError(f"{closed[0].upper()}{closed[1:]}.")
-            log.warning("MARKET CLOSED: %s. Continuing because this is only a check; "
-                        "a real run would stop here.", closed)
-        if server_offset is None:
-            server_offset = 0
-            log.warning("Broker server time unknown (no fresh quotes); the same-day guard uses UTC")
+            log.warning("MARKET CLOSED right now: %s. This is only a check, so it goes on; "
+                        "the market has to be open at the moment of the trade.", closed)
         lot_problems = tm.validate_lots(t.lots, info.volume_min, info.volume_max, info.volume_step)
         if lot_problems:
             raise PreflightError(f"{sym}: " + "; ".join(lot_problems) + ".")
@@ -497,6 +511,7 @@ class Mt5Client:
         }
         filling = self._order_check(request, price, tp, sl, strict_market=strict_market)
         request["type_filling"] = filling
+        self.remember_positions()  # raises if they cannot be read: never guess
 
         return Preflight(
             symbol=sym, order_type=order_type, digits=int(info.digits), point=float(info.point),
@@ -505,8 +520,7 @@ class Mt5Client:
             tp_distance=tp_d, sl_distance=sl_d, request=request, price=price, bid=tick.bid, ask=tick.ask,
             spread_points=tm.spread_points(tick.bid, tick.ask, info.point), tp_preview=tp, sl_preview=sl,
             margin_required=margin, margin_free=free, margin_warning=margin_warning,
-            server_offset_s=server_offset, account_kind=tm.account_kind(getattr(acc, "trade_mode", 2)),
-            hedging=hedging,
+            account_kind=tm.account_kind(getattr(acc, "trade_mode", 2)), hedging=hedging,
         )
 
     def _order_check(self, request: dict, price: float, tp: Optional[float], sl: Optional[float], *,
@@ -535,7 +549,8 @@ class Mt5Client:
         comment = getattr(result, "comment", "")
         if code == tm.TRADE_RETCODE_MARKET_CLOSED:
             if not strict_market:
-                log.warning("order_check: market closed (%s) - fine for a check, a real run would stop", comment)
+                log.warning("order_check: market closed (%s) - fine for a check; the market has to be "
+                            "open at the moment of the trade", comment)
                 return filling
             raise PreflightError(f"The market for {request['symbol']} is closed right now ({comment}).")
         if code == tm.TRADE_RETCODE_NO_MONEY:
@@ -548,43 +563,64 @@ class Mt5Client:
         tick = self.mt5.symbol_info_tick(self.cfg.trade.symbol)
         if tick is not None:
             self.last_tick = tick
+        try:
+            self.remember_positions()
+        except Mt5Error as exc:  # keep the list from the preflight
+            log.debug("%s", exc)
 
-    # ------------------------------------------------------------------ guard
+    def remember_positions(self) -> None:
+        """Note which of our positions are open now, before the send.
 
-    def existing_trade(self, target_date: date, tz, server_offset_s: int) -> Optional[str]:
-        """Reason not to open (open position or already opened today), else None."""
+        Earlier runs may still have positions open (there is no limit per day), so
+        after the send only a ticket that is NOT in this list can be the new one.
+        The list only grows: a read that misses a position must not make it "new",
+        and the ticket of a position that has closed is never used again anyway.
+        """
         t = self.cfg.trade
-        positions = self.positions(symbol=t.symbol)  # raises if unreadable: never guess
-        now = self.clock.time()
-        # Deal times are broker server time, so ask for a wide window and filter exactly.
-        deals = self.deals(int(now - 3 * 86400), int(now + 2 * 86400))
-        if deals is None:
-            log.warning("Could not read the deal history (%s); only open positions were checked", self._err())
-            deals = ()
-        return tm.existing_trade_reason(
-            positions, deals, magic=t.magic, symbol=t.symbol, target_date=target_date, tz=tz,
-            server_offset_s=server_offset_s,
-        )
+        seen = frozenset(int(p.ticket) for p in self.positions(symbol=t.symbol) if p.magic == t.magic)
+        self._known_tickets = self._known_tickets | seen
 
     # ------------------------------------------------------------------ send
 
     def find_position(self, order_ticket: Optional[int] = None, wait_s: float = 0.0):
+        """The position our order opened.
+
+        With the order's ticket (the broker answered): the position with that
+        ticket, or the position the order's own deal belongs to. That is asked
+        again and again until wait_s is over, because the position list can lag
+        the answer by a moment. Guessing comes last: only when the time is up, or
+        when there is no order ticket at all (no answer from the broker), our
+        newest position that was not open before the send is taken.
+        """
         t = self.cfg.trade
-        deadline = time.monotonic() + wait_s
+        deadline = self.clock.time() + wait_s
         while True:
+            time_is_up = self.clock.time() >= deadline
             try:
                 if order_ticket:
-                    found = self.positions(ticket=order_ticket)
+                    found = self.positions(ticket=order_ticket) or self._position_of_order(order_ticket)
                     if found:
                         return found[0]
-                ours = [p for p in self.positions(symbol=t.symbol) if p.magic == t.magic]
-                if ours:
-                    return max(ours, key=lambda p: getattr(p, "time_msc", 0))
+                if time_is_up or not order_ticket:
+                    ours = [p for p in self.positions(symbol=t.symbol)
+                            if p.magic == t.magic and int(p.ticket) not in self._known_tickets]
+                    if ours:
+                        return max(ours, key=lambda p: getattr(p, "time_msc", 0))
             except Mt5Error as exc:
                 log.warning("%s", exc)
-            if time.monotonic() >= deadline:
+            if time_is_up:
                 return None
             self._sleep(0.1)
+
+    def _position_of_order(self, order_ticket: int) -> tuple:
+        """The open position that the deal of this order belongs to (() if not known yet)."""
+        for deal in self.deals(ticket=order_ticket) or ():  # the deals made by this order
+            position_id = int(getattr(deal, "position_id", 0) or 0)
+            if position_id and position_id != order_ticket:
+                found = self.positions(ticket=position_id)
+                if found:
+                    return found
+        return ()
 
     def fire(self, pf: Preflight, target_ts: float, *, dry_run: bool, max_late_ms: float,
              max_spread_points: Optional[float]) -> SendResult:
@@ -596,7 +632,8 @@ class Mt5Client:
             late = (clock.time() - target_ts) * 1000.0
             if late > max_late_ms:
                 res.status = "skipped_late" if res.attempts == 0 else "failed"
-                res.comment = f"{late:.0f} ms after the target (max_late_ms is {max_late_ms:g})"
+                res.comment = (f"{late / 1000.0:.1f} s after the target, more than the allowed "
+                               f"{max_late_ms / 1000.0:g} s (max_late_ms)")
                 if res.attempts:
                     res.comment += f"; gave up after {res.attempts} attempts ({tm.retcode_text(res.retcode)})"
                 return res

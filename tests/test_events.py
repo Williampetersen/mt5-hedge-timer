@@ -13,13 +13,13 @@ from hedgebot.notify import Notifier
 T0 = datetime(2026, 11, 16, 13, 29, 45, tzinfo=timezone.utc)  # 14:29:45 CET, Monday
 
 
-def make_app(cfg, tmp_path, *, start, dry_run=False, emit=True):
+def make_app(cfg, tmp_path, *, start, dry_run=False, emit=True, check_first=False):
     clock = FakeClock(start)
     mt5 = FakeMT5(clock)
     app = HedgeApp(
         cfg, dry_run=dry_run, notifier=Notifier(), journal=Journal(tmp_path / "journal.csv"), clock=clock,
         client_factory=lambda c, clock, sleep: Mt5Client(c, clock=clock, mt5=mt5, sleep=sleep),
-        ntp=lambda server: 0.0, sleep=clock.sleep, boost=False, emit_results=emit,
+        ntp=lambda server: 0.0, sleep=clock.sleep, boost=False, emit_results=emit, check_first=check_first,
     )
     return app, mt5, clock
 
@@ -48,6 +48,27 @@ def test_run_reports_every_stage(buy_raw, tmp_path, capsys):
     assert armed["margin_required"] > 0 and armed["margin_warning"] is None
     assert opened["fill_price"] == 2650.30 and opened["tp_price"] == 2675.30 and opened["ticket"]
     assert results[0]["status"] == "opened" and results[0]["note"] == ""
+
+
+def test_check_first_reports_ready_long_before_the_target(buy_raw, tmp_path, capsys):
+    buy_raw["monitor"]["enabled"] = False
+    app, mt5, clock = make_app(make_cfg(buy_raw), tmp_path, start=T0.timestamp() - 600, check_first=True)
+    assert app.run_once() == EXIT_OK
+    events, results = parse(capsys.readouterr().out)
+    assert [e["stage"] for e in events] == ["waiting", "checking", "ready", "prearm", "armed", "opened"]
+    ready = events[2]
+    assert ready["login"] == 1001 and ready["symbol"] == "XAUUSD" and ready["tp_price"] == 2675.30
+    assert ready["target_ts"] == T0.timestamp() and ready["margin_required"] > 0
+    assert results[0]["status"] == "opened"
+
+
+def test_check_first_failure_is_a_result_with_the_reason(buy_cfg, tmp_path, capsys):
+    app, mt5, clock = make_app(buy_cfg, tmp_path, start=T0.timestamp() - 600, check_first=True)
+    mt5.symbols_present = {"GOLD"}
+    assert app.run_once() == EXIT_ERROR
+    events, results = parse(capsys.readouterr().out)
+    assert [e["stage"] for e in events] == ["waiting", "checking"]
+    assert results[0]["status"] == "error" and "does not exist" in results[0]["note"]
 
 
 def test_monitor_reports_profit_and_close(buy_cfg, tmp_path, capsys, monkeypatch):
@@ -101,7 +122,7 @@ def test_check_reports_the_account_or_the_error(buy_cfg, tmp_path, capsys):
     assert app.run_check() == EXIT_OK
     events, _ = parse(capsys.readouterr().out)
     check = events[-1]
-    assert check["stage"] == "check" and check["ok"] is True and check["skip_reason"] == ""
+    assert check["stage"] == "check" and check["ok"] is True and "skip_reason" not in check
     assert check["balance"] == 10_000.0 and check["leverage"] == 100 and check["spread_points"] == 30
 
     app, mt5, _ = make_app(buy_cfg, tmp_path, start=T0.timestamp() - 3600)

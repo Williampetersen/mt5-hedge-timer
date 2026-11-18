@@ -1,16 +1,13 @@
-from datetime import date
 from types import SimpleNamespace as NS
-from zoneinfo import ZoneInfo
 
 import pytest
 
 from conftest import make_cfg
-from fake_mt5 import SERVER_OFFSET, FakeClock, FakeMT5
+from fake_mt5 import FakeClock, FakeMT5
 from hedgebot import trade_math as tm
-from hedgebot.mt5_client import Mt5Client, Mt5Error, PreflightError
+from hedgebot.mt5_client import MARKET_SETTLE_S, Mt5Client, Mt5Error, PreflightError
 
 T0 = 1_794_835_785.0  # 2026-11-16 13:29:45 UTC = 14:29:45 CET (a Monday)
-CPH = ZoneInfo("Europe/Copenhagen")
 
 
 def make_client(cfg, mt5=None, t=T0 - 30):
@@ -94,7 +91,6 @@ def test_preflight_computes_tp_distance_and_prebuilds_request(buy_cfg):
     assert pf.tp_preview == 2675.30  # ask 2650.30 + 25
     assert "price" not in pf.request and pf.request["type"] == tm.ORDER_TYPE_BUY
     assert pf.request["volume"] == 0.06 and pf.request["magic"] == 20261115
-    assert pf.server_offset_s == SERVER_OFFSET
     assert pf.margin_required == pytest.approx(0.06 * 100 * 2650.30 / 100, abs=0.01)
     assert mt5.checked and not mt5.sent  # order_check only, nothing sent
 
@@ -130,11 +126,43 @@ def test_market_closed_on_weekend_stale_quotes(buy_cfg):
 def test_market_closed_for_this_symbol_only(buy_cfg):
     mt5 = FakeMT5()
     mt5.tick_age_s = 1800  # gold paused, FX still quoting
-    client, mt5, _ = make_client(buy_cfg, mt5)
+    client, mt5, clock = make_client(buy_cfg, mt5)
     client.connect()
     client.check_account()
+    before = clock.t
     with pytest.raises(PreflightError, match="30 min old"):
         client.preflight()
+    assert clock.t - before == pytest.approx(MARKET_SETTLE_S, abs=0.5)  # it waited for fresh prices first
+
+
+def test_old_prices_right_after_the_terminal_started_are_given_a_moment(buy_cfg):
+    """A terminal that has only just started still shows the prices of its last session."""
+    mt5 = FakeMT5()
+    mt5.tick_age_s = 16 * 3600  # yesterday's last price
+    client, mt5, clock = make_client(buy_cfg, mt5)
+    real_tick = mt5.symbol_info_tick
+    calls = {"n": 0}
+
+    def symbol_info_tick(name):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            mt5.tick_age_s = 0.0  # the first fresh price arrives about a second later
+        return real_tick(name)
+
+    mt5.symbol_info_tick = symbol_info_tick
+    client.connect()
+    client.check_account()
+    pf = client.preflight()  # does not raise "market closed"
+    assert pf.tp_distance == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize("broker_hours", [-11, 0, 3, 13])
+def test_the_brokers_clock_does_not_matter(buy_cfg, monkeypatch, broker_hours):
+    """MT5 reports quote times in the broker's clock; whatever that clock says, the trade goes out."""
+    monkeypatch.setattr("fake_mt5.SERVER_OFFSET", broker_hours * 3600)
+    client, mt5, clock, pf = armed(buy_cfg)
+    res = fire(client, pf)
+    assert res.status == "opened" and res.deviation_ms == pytest.approx(0.0)
 
 
 def test_wrong_broker_tick_value_does_not_matter(buy_cfg):
@@ -242,6 +270,7 @@ def test_too_late_does_not_send(buy_cfg):
     clock.t = T0 + 2.5
     res = fire(client, pf)
     assert res.status == "skipped_late" and not mt5.sent
+    assert "2.5 s after the target" in res.comment and "allowed 2 s" in res.comment
 
 
 def test_retries_stop_once_past_max_late(buy_cfg):
@@ -311,23 +340,160 @@ def test_sl_money_is_placed_on_the_other_side(buy_raw):
     assert mt5.sent[0]["sl"] == 2640.30
 
 
-# --------------------------------------------------------------------------- guard + monitor
+# --------------------------------------------------------------------------- no limit per day
 
 
-def test_guard_sees_open_position(buy_cfg):
+def test_positions_of_earlier_runs_do_not_block_a_new_one(buy_cfg):
     client, mt5, clock, pf = armed(buy_cfg)
-    fire(client, pf)
-    reason = client.existing_trade(date(2026, 11, 17), CPH, pf.server_offset_s)
-    assert reason and "already open" in reason
+    first = fire(client, pf)
+    assert first.status == "opened"
+    pf = client.preflight()  # the next run, while the first position is still open
+    second = fire(client, pf)
+    third = fire(client, client.preflight())
+    assert second.status == third.status == "opened"
+    tickets = {first.position_ticket, second.position_ticket, third.position_ticket}
+    assert len(tickets) == 3 and len(mt5.positions) == 3
+    assert [r["action"] for r in mt5.sent].count(tm.TRADE_ACTION_DEAL) == 3
 
 
-def test_guard_sees_position_opened_and_closed_today(buy_cfg):
+def test_no_reply_is_not_mistaken_for_an_earlier_position(buy_cfg):
+    """With no answer from the broker, only a NEW position counts as opened."""
     client, mt5, clock, pf = armed(buy_cfg)
+    earlier = fire(client, pf)
+    pf = client.preflight()
+    mt5.send_codes = [None]
     res = fire(client, pf)
-    mt5.close_position(res.position_ticket, 2675.35)
-    reason = client.existing_trade(date(2026, 11, 16), CPH, pf.server_offset_s)
-    assert reason and "today" in reason
-    assert client.existing_trade(date(2026, 11, 17), CPH, pf.server_offset_s) is None
+    assert res.status == "failed" and res.position_ticket is None
+    assert [p.ticket for p in mt5.positions] == [earlier.position_ticket]
+
+
+def test_no_reply_but_the_order_went_through_is_found(buy_cfg):
+    client, mt5, clock, pf = armed(buy_cfg)
+    earlier = fire(client, pf)
+    pf = client.preflight()
+    real_send = mt5.order_send
+
+    def lost_answer(request):
+        real_send(request)  # the broker filled it ...
+        mt5.last_err = (-10005, "IPC timeout")
+        return None  # ... but the answer never arrived
+
+    mt5.order_send = lost_answer
+    res = fire(client, pf)
+    assert res.status == "opened" and res.position_ticket not in (None, earlier.position_ticket)
+    assert res.fill_price == 2650.30 and len(mt5.positions) == 2
+
+
+def test_the_list_of_earlier_positions_is_kept_fresh_while_armed(buy_cfg):
+    client, mt5, clock, pf = armed(buy_cfg)
+    assert client._known_tickets == frozenset()
+    # a position of ours appears after the preflight (e.g. a second window) ...
+    mt5.positions.append(NS(ticket=777, symbol="XAUUSD", magic=20261115, type=0, volume=0.06,
+                            price_open=2650.0, tp=0.0, sl=0.0, profit=0.0, time_msc=0))
+    client.warm_tick()  # ... and the armed wait notices it
+    assert client._known_tickets == frozenset({777})
+    mt5.send_codes = [None]
+    assert fire(client, pf).status == "failed"  # not taken for the new one
+    mt5.positions_get = lambda **kw: None  # unreadable for a moment: keep the last list
+    mt5.last_err = (-1, "pipe broken")
+    client.warm_tick()
+    assert client._known_tickets == frozenset({777})
+
+
+def test_a_read_that_misses_a_position_does_not_forget_it(buy_cfg):
+    """The list of earlier positions only grows, so one incomplete read cannot make an old position "new"."""
+    client, mt5, clock, pf = armed(buy_cfg)
+    earlier = fire(client, pf)
+    client.preflight()
+    assert client._known_tickets == frozenset({earlier.position_ticket})
+    real_get = mt5.positions_get
+    mt5.positions_get = lambda **kw: ()  # the terminal lists nothing for a moment
+    client.warm_tick()
+    assert client._known_tickets == frozenset({earlier.position_ticket})
+    mt5.positions_get = real_get
+    mt5.send_codes = [None]  # no answer, and nothing was filled
+    res = fire(client, client.preflight())
+    assert res.status == "failed" and res.position_ticket is None
+
+
+def test_a_late_position_list_never_makes_an_earlier_position_the_new_one(buy_cfg):
+    """The broker says done, but the new position shows up 0.3 s later: wait for it, do not guess."""
+    client, mt5, clock, pf = armed(buy_cfg)
+    earlier = fire(client, pf)
+    pf = client.preflight()
+    client._known_tickets = frozenset()  # worst case: every read before the send missed the earlier one
+    real_get, real_send = mt5.positions_get, mt5.order_send
+    listed_from = {"t": None}
+
+    def positions_get(**kw):
+        found = real_get(**kw)
+        if listed_from["t"] is not None and clock.t < listed_from["t"]:
+            found = tuple(p for p in found if p.ticket == earlier.position_ticket)
+        return found
+
+    def order_send(request):
+        result = real_send(request)
+        if request["action"] == tm.TRADE_ACTION_DEAL:
+            listed_from["t"] = clock.t + 0.3
+        return result
+
+    mt5.positions_get, mt5.order_send = positions_get, order_send
+    real_deals = mt5.history_deals_get
+
+    def history_deals_get(*args, **kw):  # the history lags just like the position list
+        hidden = listed_from["t"] is not None and clock.t < listed_from["t"]
+        return () if hidden else real_deals(*args, **kw)
+
+    mt5.history_deals_get = history_deals_get
+    res = fire(client, pf)
+    assert res.status == "opened" and res.position_ticket not in (None, earlier.position_ticket)
+    assert res.position_ticket == res.order_ticket and len(mt5.positions) == 2
+    assert client.correct_tp_sl(pf, res) is None
+    assert mt5.positions[0].ticket == earlier.position_ticket and mt5.positions[0].tp == 2675.30  # untouched
+
+
+def test_a_position_with_another_ticket_than_its_order_is_found_through_the_deal(buy_cfg):
+    """Some servers give the position its own number: the order's deal says which position it is."""
+    client, mt5, clock, pf = armed(buy_cfg)
+    earlier = fire(client, pf)
+    pf = client.preflight()
+    client._known_tickets = frozenset()  # even without the list of earlier positions
+    real_send = mt5.order_send
+
+    def order_send(request):
+        result = real_send(request)
+        if request["action"] == tm.TRADE_ACTION_DEAL:
+            mt5.positions[-1].ticket = 9_000_001  # not the order's ticket
+            mt5.deals[-1].position_id = 9_000_001
+        return result
+
+    mt5.order_send = order_send
+    res = fire(client, pf)
+    assert res.status == "opened" and res.position_ticket == 9_000_001 != res.order_ticket
+    assert res.position_ticket != earlier.position_ticket
+
+
+def test_unreadable_positions_stop_the_preflight(buy_cfg):
+    client, mt5, _ = make_client(buy_cfg)
+    client.connect()
+    client.check_account()
+    mt5.positions_get = lambda **kw: None
+    mt5.last_err = (-1, "pipe broken")
+    with pytest.raises(Mt5Error, match="Could not read open positions"):
+        client.preflight()
+
+
+def test_netting_account_still_refuses_a_second_position(buy_cfg):
+    """One netting account holds one position per symbol: a new order would be merged into it."""
+    mt5 = FakeMT5()
+    mt5.account.margin_mode = tm.ACCOUNT_MARGIN_MODE_RETAIL_NETTING
+    client, mt5, clock, pf = armed(buy_cfg, mt5)
+    assert fire(client, pf).status == "opened"
+    with pytest.raises(PreflightError, match="NETTING account"):
+        client.preflight()
+
+
+# --------------------------------------------------------------------------- monitor
 
 
 def test_monitor_reports_tp_close(buy_cfg):

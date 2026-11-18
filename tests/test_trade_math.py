@@ -1,12 +1,6 @@
-from datetime import date, datetime, timezone
-from types import SimpleNamespace as NS
-from zoneinfo import ZoneInfo
-
 import pytest
 
 from hedgebot import trade_math as tm
-
-CPH = ZoneInfo("Europe/Copenhagen")
 
 
 # --- money -> price distance
@@ -21,14 +15,20 @@ def test_distance_from_contract_size():
     assert tm.distance_from_contract(150, 0.06, 100) == pytest.approx(25.0)
 
 
-def test_market_state():
+def test_market_closed_reason():
     utc = 1_000_000_000.0
-    server = utc + 7200
-    assert tm.market_state("X", server, server, utc) == (7200, None)
-    off, problem = tm.market_state("X", server - 600, server, utc)
-    assert off == 7200 and "10 min old" in problem
-    off, problem = tm.market_state("X", server - 47 * 3600, server - 47 * 3600, utc)
-    assert off is None and "market is closed" in problem
+    server = utc + 7200  # quote times are in the broker's own clock
+    assert tm.market_closed_reason("X", server, server, utc) is None
+    assert "10 min old" in tm.market_closed_reason("X", server - 600, server, utc)
+    assert "market is closed" in tm.market_closed_reason("X", server - 47 * 3600, server - 47 * 3600, utc)
+
+
+@pytest.mark.parametrize("broker_hours", [-12, -5, 0, 2, 3, 9, 14])
+def test_the_brokers_time_zone_never_closes_the_market(broker_hours):
+    """Prices that are coming in are fine, whatever clock the broker runs on."""
+    utc = 1_000_000_000.0
+    server = utc + broker_hours * 3600
+    assert tm.market_closed_reason("X", server - 2, server, utc) is None
 
 
 def test_suggest_symbols():
@@ -154,49 +154,6 @@ def test_retry_at_most_three_times():
     assert tm.should_retry(10004, 1)  # retry 1
     assert tm.should_retry(10004, 3)  # retry 3
     assert not tm.should_retry(10004, 4)  # 4 sends done = 3 retries used
-
-
-# --- one position per day guard
-
-
-def pos(ticket=1, magic=20261115, symbol="XAUUSD"):
-    return NS(ticket=ticket, magic=magic, symbol=symbol)
-
-
-def deal(when_utc, *, ticket=9, magic=20261115, symbol="XAUUSD", entry=tm.DEAL_ENTRY_IN, server_offset=7200):
-    server_ms = int((when_utc.timestamp() + server_offset) * 1000)
-    return NS(ticket=ticket, magic=magic, symbol=symbol, entry=entry, time=server_ms // 1000, time_msc=server_ms)
-
-
-GUARD = dict(magic=20261115, symbol="XAUUSD", target_date=date(2026, 11, 16), tz=CPH, server_offset_s=7200)
-
-
-def test_guard_blocks_open_position_with_same_magic_and_symbol():
-    assert "already open" in tm.existing_trade_reason([pos()], [], **GUARD)
-
-
-def test_guard_ignores_other_magic_or_symbol():
-    assert tm.existing_trade_reason([pos(magic=1), pos(symbol="EURUSD")], [], **GUARD) is None
-
-
-def test_guard_blocks_second_open_on_the_same_day():
-    morning = datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)  # 09:00 CET
-    assert "today" in tm.existing_trade_reason([], [deal(morning)], **GUARD)
-
-
-def test_guard_allows_when_last_open_was_yesterday():
-    yesterday = datetime(2026, 11, 15, 13, 29, 45, tzinfo=timezone.utc)
-    assert tm.existing_trade_reason([], [deal(yesterday)], **GUARD) is None
-
-
-def test_guard_ignores_closing_deals():
-    today = datetime(2026, 11, 16, 9, 0, tzinfo=timezone.utc)
-    assert tm.existing_trade_reason([], [deal(today, entry=tm.DEAL_ENTRY_OUT)], **GUARD) is None
-
-
-def test_server_offset_estimate():
-    assert tm.estimate_server_offset(1_000_007_205, 1_000_000_000) == 7200
-    assert tm.estimate_server_offset(1_000_000_003, 1_000_000_000) == 0
 
 
 # --- misc

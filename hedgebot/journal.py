@@ -1,4 +1,4 @@
-"""CSV trade journal: one row per run in data/journal.csv.
+"""CSV trade journal: one row per run in data/journal.csv (any number of runs per day).
 
 Both apps may append to the same file, so writes go through a small lock
 file. If the CSV is locked (e.g. open in Excel) the row goes to a separate
@@ -12,9 +12,9 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Iterator, Mapping
 
 log = logging.getLogger("hedgebot.journal")
 
@@ -72,10 +72,12 @@ class Journal:
         return self._store(row, upsert=False)
 
     def upsert(self, row: Mapping[str, Any]) -> Path:
-        """Replace this app's row for the same position_ticket, or append a new row.
+        """Replace this app's row for the same run and position_ticket, or append a new row.
 
         Used to write a trade as soon as it is filled and fill in the close
-        details later, so a killed process never loses the record.
+        details later, so a killed process never loses the record. Only the row
+        of the same run (same target time) is replaced: an earlier run is never
+        overwritten, even if a ticket number comes back after an account change.
         """
         return self._store(row, upsert=True)
 
@@ -103,7 +105,8 @@ class Journal:
     def _replace(self, row: dict[str, str]) -> bool:
         rows = self.rows()
         for i, r in enumerate(rows):
-            if r.get("position_ticket") == row["position_ticket"] and r.get("app_name") == row["app_name"]:
+            if (r.get("position_ticket") == row["position_ticket"] and r.get("app_name") == row["app_name"]
+                    and (r.get("target_time") or "") == row["target_time"]):
                 rows[i] = row
                 tmp = self.path.with_name(self.path.name + ".tmp")
                 with tmp.open("w", newline="", encoding="utf-8") as fh:
@@ -128,16 +131,3 @@ class Journal:
             return []
         with self.path.open(newline="", encoding="utf-8") as fh:
             return list(csv.DictReader(fh))
-
-    def opened_on(self, app_name: str, login: int, day: date) -> Optional[str]:
-        """Reason string if this app already logged an opened trade on `day`."""
-        try:
-            rows = self.rows()
-        except (OSError, csv.Error) as exc:
-            log.warning("Could not read journal %s: %s", self.path, exc)
-            return None
-        for r in rows:
-            if (r.get("app_name") == app_name and r.get("login") == str(login)
-                    and r.get("date") == day.isoformat() and r.get("status") == "opened"):
-                return f"the journal already has an opened trade for {app_name} on {day.isoformat()}"
-        return None

@@ -1,5 +1,14 @@
 # Project: MT5 Hedge Timer (two apps: one BUY, one SELL)
 
+> **Changed since this spec was written (Aitrade 0.10.0, November 2026). These points win over the text below:**
+> - **No limit per day** (replaces "never open more than one position per day" in 5.8 and the guard test in 7).
+>   Every run opens one position, also while positions of earlier runs are still open.
+> - **The Aitrade window goes by the PC's own clock.** It never shifts the clock by NTP (5.3); internet time is
+>   only used to warn when the PC clock is wrong. The broker's time plays no part in when a position opens.
+> - **Checks run at once.** With `--check-first` (the window always uses it) an app connects and runs every
+>   check as soon as the run starts, and again at the prearm (5.4 and 5.5).
+> - **Both sides or none.** The window stops the other side when one side fails or is not ready in time.
+
 Build a complete, production-quality Python project in this folder. Follow this spec exactly. If something is ambiguous, make the safest reasonable choice and list your choices at the end. Do not place real orders yourself while developing.
 
 ## 1. Goal

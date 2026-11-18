@@ -1,14 +1,13 @@
 """Pure trading math and the MT5 constants it needs.
 
 No MetaTrader5 import here, so every rule (TP/SL from money, rounding, lot
-steps, filling mode, retry rules, one-position-per-day guard) is unit-tested
+steps, filling mode, retry rules, closed-market detection) is unit-tested
 without MT5 installed. The numeric constants are the documented MQL5 values.
 """
 
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Iterable, Optional
 
@@ -322,38 +321,35 @@ def should_retry(retcode: Optional[int], sends_done: int, max_retries: int = MAX
     return retcode in RETRYABLE_RETCODES and sends_done <= max_retries
 
 
-def estimate_server_offset(server_ts: float, utc_ts: float, granularity_s: int = 900) -> int:
-    """Broker server time minus UTC, rounded to 15 min (MT5 reports times in server time)."""
-    return int(round((server_ts - utc_ts) / granularity_s) * granularity_s)
-
-
 MAX_TICK_AGE_S = 300.0  # older last price (vs the freshest quote on the terminal) = market closed
-MAX_SERVER_OFFSET_S = 14.5 * 3600  # no broker runs further than this from UTC
+MAX_QUOTE_GAP_S = 14.5 * 3600  # no broker's clock runs further than this from UTC
 
 
-def market_state(
+def market_closed_reason(
     symbol: str,
     symbol_tick_ts: float,
     freshest_tick_ts: float,
     utc_now_ts: float,
     *,
     max_age_s: float = MAX_TICK_AGE_S,
-) -> tuple[Optional[int], Optional[str]]:
-    """(estimated server offset, problem) from tick times in broker server time.
+) -> Optional[str]:
+    """Why the market looks closed right now, or None when prices are coming in.
 
-    MT5 has no "server time now", so the freshest quote across Market Watch
-    stands in for it. order_check() does NOT detect a closed market, hence this.
+    Only the AGE of the prices is judged, never what time it is at the broker:
+    the trigger time comes from the PC clock alone. Quote times are in the
+    broker's own clock, so the symbol's last price is compared with the
+    freshest quote in Market Watch (same clock, any time zone). order_check()
+    does NOT detect a closed market, hence this.
     """
-    raw_offset = freshest_tick_ts - utc_now_ts
-    if abs(raw_offset) > MAX_SERVER_OFFSET_S:
-        return None, ("no fresh prices on this terminal (weekend, holiday or no data feed): "
-                      "the market is closed")
-    offset = estimate_server_offset(freshest_tick_ts, utc_now_ts)
+    if abs(freshest_tick_ts - utc_now_ts) > MAX_QUOTE_GAP_S:
+        # Further from now than any broker time zone can explain: nothing is quoting at all.
+        return ("no fresh prices on this terminal (weekend, holiday or no data feed): "
+                "the market is closed")
     age = freshest_tick_ts - symbol_tick_ts
     if age > max_age_s:
-        return offset, (f"the last {symbol} price is {age / 60:.0f} min old while other symbols are "
-                        "quoting: the market for it looks closed")
-    return offset, None
+        return (f"the last {symbol} price is {age / 60:.0f} min old while other symbols are "
+                "quoting: the market for it looks closed")
+    return None
 
 
 _SYMBOL_ALIASES = {
@@ -376,32 +372,3 @@ def suggest_symbols(wanted: str, names: Iterable[str], limit: int = 10) -> list[
                 scored.append((rank, len(name), name))
                 break
     return [n for _, _, n in sorted(scored)][:limit]
-
-
-def existing_trade_reason(
-    positions: Iterable,
-    deals: Iterable,
-    *,
-    magic: int,
-    symbol: str,
-    target_date: date,
-    tz,
-    server_offset_s: int,
-) -> Optional[str]:
-    """Why we must NOT open today, or None.
-
-    Blocks when a position with our magic+symbol is still open (from any day),
-    or when one was already opened on the target's calendar day (schedule zone).
-    """
-    for p in positions or ():
-        if p.magic == magic and p.symbol == symbol:
-            return f"position #{p.ticket} ({symbol}, magic {magic}) is already open"
-    for d in deals or ():
-        if d.magic != magic or d.symbol != symbol or d.entry != DEAL_ENTRY_IN:
-            continue
-        server_ms = getattr(d, "time_msc", 0) or d.time * 1000
-        opened = datetime.fromtimestamp(server_ms / 1000.0 - server_offset_s, timezone.utc).astimezone(tz)
-        if opened.date() == target_date:
-            return (f"deal #{d.ticket} already opened a {symbol} position today at "
-                    f"{opened:%H:%M:%S} {opened.tzname()} (one position per day)")
-    return None

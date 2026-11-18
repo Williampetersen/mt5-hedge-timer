@@ -1,5 +1,7 @@
 """The engine starting MetaTrader 5 itself: start-up file, first login, Algo Trading, restart."""
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,15 @@ from conftest import make_cfg
 from fake_mt5 import FakeClock, FakeMT5
 from hedgebot import terminal
 from hedgebot.mt5_client import FIRST_START_TIMEOUT_MS, INIT_TIMEOUT_MS, Mt5Client, Mt5Error
+
+
+@pytest.fixture(autouse=True)
+def own_startup_folder(tmp_path, monkeypatch):
+    """Start-up files of these tests go to a folder of their own, never to the real temp folder."""
+    folder = tmp_path / "startup-files"
+    folder.mkdir()
+    monkeypatch.setattr(terminal, "startup_folder", lambda: folder)
+    return folder
 
 
 def read_ini(path: Path) -> str:
@@ -40,6 +51,40 @@ def test_startup_file_is_written_as_utf16_and_wiped(tmp_path):
     terminal._delete(path)
     assert not path.exists()
     terminal._delete(path)  # deleting twice is fine
+
+
+def test_deleting_a_file_that_is_already_gone_makes_no_noise(tmp_path, caplog):
+    """The window or the other engine may have cleaned it up first: that is not worth a warning."""
+    path = terminal.write_startup_config(terminal.startup_config_text(), tmp_path)
+    path.unlink()
+    with caplog.at_level("WARNING"):
+        terminal._delete(path)
+    assert caplog.records == []
+
+
+def aged(path: Path, seconds: float) -> Path:
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+    return path
+
+
+def test_start_up_files_left_behind_are_wiped_and_deleted(own_startup_folder):
+    """An engine that was stopped while starting MetaTrader 5 could not delete its file (with the password)."""
+    text = terminal.startup_config_text(login=7, server="S", password="pw")
+    left_behind = aged(terminal.write_startup_config(text), 60)
+    just_written = terminal.write_startup_config(text)  # a terminal may still have to read this one
+    other = own_startup_folder / "something-else.ini"
+    other.write_text("keep me", encoding="utf-8")
+    assert left_behind.parent == own_startup_folder and left_behind.name.startswith("mt5-start-")
+    assert terminal.delete_stale_startup_files() == 1
+    assert not left_behind.exists() and just_written.exists() and other.exists()
+    assert terminal.delete_stale_startup_files(0) == 1  # e.g. when the window closes: everything goes
+    assert not just_written.exists() and other.read_text(encoding="utf-8") == "keep me"
+    assert terminal.delete_stale_startup_files(0) == 0  # nothing left, and no error
+
+
+def test_a_missing_folder_is_not_an_error(tmp_path):
+    assert terminal.delete_stale_startup_files(0, tmp_path / "nope") == 0
 
 
 # ---------------------------------------------------------------- has this terminal logged in before?
@@ -140,6 +185,16 @@ def test_a_new_copy_gets_the_account_once_and_the_file_is_gone_afterwards(tmp_pa
     assert portable is True
     assert "Login=1001" in text and "Password=pw-b" in text and "Server=Alpha-Demo" in text and "Enabled=1" in text
     assert not rec.config_path.exists()  # the file with the password does not stay on disk
+
+
+def test_starting_a_terminal_clears_what_a_stopped_engine_left_behind(tmp_path, monkeypatch, own_startup_folder):
+    stale = terminal.write_startup_config(terminal.startup_config_text(login=7, server="S", password="old-pw"))
+    Recorder(monkeypatch)
+    monkeypatch.setattr(terminal, "MIN_CONFIG_LIFETIME_S", 5.0)
+    aged(stale, 30)
+    result = terminal.ensure_started(fresh_copy(tmp_path, logged_in=True), portable=True, **KW)
+    assert result.status == terminal.STARTED
+    assert not stale.exists() and list(own_startup_folder.iterdir()) == []  # its own file is gone as well
 
 
 def test_a_copy_that_logged_in_before_never_gets_a_password_file(tmp_path, monkeypatch):

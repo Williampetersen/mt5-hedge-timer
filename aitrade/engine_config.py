@@ -58,7 +58,9 @@ def build_engine_config(settings: Settings, side: str) -> dict:
             "dates": [plan.date],  # one run on one date
             "max_late_ms": adv.max_late_ms,
             "prearm_seconds": adv.prearm_seconds,
-            "use_ntp_offset": adv.use_ntp,
+            # The PC's own clock decides when to open and is never shifted. (advanced.use_ntp only
+            # makes the window compare the PC clock with internet time and warn when it is wrong.)
+            "use_ntp_offset": False,
             "ntp_server": adv.ntp_server,
             "max_clock_offset_ms": MAX_CLOCK_OFFSET_MS,
         },

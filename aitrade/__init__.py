@@ -4,5 +4,5 @@
 engine process (one account, one MT5 terminal); the window starts two of them.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 APP_NAME = "Aitrade"

@@ -10,13 +10,28 @@ line are needed.
   (broker, server, account number, password, demo or real, symbol, and which
   MetaTrader 5 copy to use), the trade (lot size, take profit in USD, optional
   stop loss in USD, date and time), and a check of everything.
-- **Every day after:** confirm lot size, take profit, date and time
-  (`HH:MM:SS`), then press **Run**. With more than two minutes to go, both
-  accounts are tested first (MetaTrader 5 opens and logs in). Then the app
-  counts down, opens both positions at the set second, and shows the fill, the
-  take profit and the profit of each side until it closes.
-- **Date and time are the PC's own time.** The PC clock is compared with
-  internet time and corrected, so the positions open at the true time.
+- **Every run:** confirm lot size, take profit, date and time (`HH:MM:SS`),
+  then press **Run**. Both MetaTrader 5 copies open and log in **at once** and
+  every check runs right away, however far away the time is, so a problem shows
+  immediately and both accounts are ready long before the time. The checks run
+  once more 30 seconds before the time. Then the app opens both positions at
+  the set second, and shows the fill, the take profit and the profit of each
+  side until it closes.
+- **No limit per day.** Run as often as you like, also while positions of
+  earlier runs are still open. While a run is still watching its positions,
+  press **Stop** first (the positions stay open in MetaTrader 5 with their take
+  profit), then set the new time and press **Run** again.
+- **Both sides or none.** If one account does not get through its checks, or
+  its MetaTrader 5 is still not ready two seconds before the time, the other
+  side is stopped too, so you do not end up with a BUY without a SELL. A run
+  needs at least 5 seconds, and more when MetaTrader 5 is closed, because it
+  has to start and log in first.
+- **The PC's own clock decides.** The positions open when this PC's clock
+  reaches the date and time you set. The broker's time and the time shown in
+  MetaTrader 5 play no part in it. The PC clock is compared with internet time
+  only to warn you when it is wrong (the note next to the clock); it is never
+  shifted. To set it right: Windows Settings, Time & language, Date & time,
+  Sync now.
 - **Take profit and stop loss are in USD**, also on an account in another
   currency (the broker's own exchange rate is used).
 - **Passwords** are kept in the Windows password vault (Credential Manager,
@@ -125,19 +140,26 @@ run_pair.py ── validates the pair ──┬── python -m hedgebot --confi
                                     └── python -m hedgebot --config config/sell.yaml  → C:\MT5_Sell → account #2
 ```
 
-What each app does on a trading day:
+What each app does on a run:
 
 1. Works out the next target time in the config's timezone (summer/winter time
    handled; the Windows timezone setting is never used, so a UTC VPS works too).
-2. Measures the PC clock error against NTP and corrects for it.
-3. Sleeps until `prearm_seconds` before the target, then connects to its
+2. Measures the PC clock error against NTP and corrects for it (only with
+   `use_ntp_offset: true`; the Aitrade window always goes by the PC clock as it
+   is).
+3. With `--check-first` (the Aitrade window always uses it): connects and runs
+   every check **right away**, so a problem shows at once and MetaTrader 5 is
+   open and logged in long before the time. A closed market is only a warning
+   at this point.
+4. Sleeps until `prearm_seconds` before the target, then connects to its
    terminal and runs the preflight checks: right account, Algo Trading on,
    demo account (unless allowed), symbol, market open, lot size, margin, TP
    distance, filling mode and a broker-side `order_check`.
-4. Sleeps until 1 s before the target, spins until the exact moment, reads a
-   fresh price and sends the market order. It logs the send time, the deviation
-   from the target, the round-trip time, the spread and the slippage.
-5. Corrects the TP from the real fill price so the money amount is exact, then
+5. Sleeps until 1 s before the target, spins until the exact moment, reads a
+   fresh price and sends the market order, which was built in step 4. It logs
+   the send time, the deviation from the target, the round-trip time, the
+   spread and the slippage.
+6. Corrects the TP from the real fill price so the money amount is exact, then
    watches the position until it closes (TP, SL, stop-out or manual) and writes
    a row to `data/journal.csv`.
 
@@ -321,8 +343,8 @@ usually disagree by a few milliseconds. The `[PAIR]` line shows how much of the
 send-time difference comes from that. In the example, the scheduling itself
 differed by only 0.04 ms. Either way both orders go out in the same second.
 
-Each app opens at most one position per day (see [below](#one-position-per-day)),
-so close the demo positions in MT5 if you want to test again on the same day.
+There is no limit per day (see [below](#no-limit-per-day)): run the test again
+as often as you like, also while the positions of the last test are still open.
 
 ## 9. The scheduled run
 
@@ -336,6 +358,7 @@ The same from PowerShell:
 ```powershell
 .\START.bat                       # validate the pair, then run today's (or the next) scheduled trade
 .\START.bat --loop                # keep running and trade on every scheduled day
+.\START.bat --check-first         # one run: test both sides right away, then wait for the time
 ```
 
 Or start one side on its own: `scripts\start_buy.bat`, `scripts\start_sell.bat`
@@ -343,9 +366,12 @@ Or start one side on its own: `scripts\start_buy.bat`, `scripts\start_sell.bat`
 
 Recommendations:
 
-- Keep both MT5 terminals **open and logged in**. The app can start a terminal
-  itself, but that takes time and may eat into `prearm_seconds`.
-- Start the apps at least a few minutes before the target time.
+- For a single run, start with `--check-first`: both sides connect and run
+  every check at once, so MetaTrader 5 is open and logged in long before the
+  time. It cannot be combined with `--loop`. Without it (and always with
+  `--loop`), keep both MT5 terminals **open and logged in**: the app can start
+  a terminal itself, but that takes time and may eat into `prearm_seconds`.
+- Start the apps at least a minute before the target time.
 - The PC must **not sleep**. If it wakes up more than `max_late_ms` after the target,
   the apps deliberately do **not** open.
 
@@ -381,28 +407,34 @@ python -m hedgebot --config config/buy.yaml --dry-run    # everything, but order
 python -m hedgebot --config config/buy.yaml --test-in 60 # target = now + 60 s (demo testing)
 python -m hedgebot --config config/buy.yaml --check      # connect + preflight + print TP/margin, then exit
 python -m hedgebot --config config/buy.yaml --loop       # keep running, trade every scheduled day
+python -m hedgebot --config config/buy.yaml --check-first  # connect + check right away, then wait for the time
 
-python run_pair.py --buy config/buy.yaml --sell config/sell.yaml [--dry-run] [--test-in N | --check | --loop]
+python run_pair.py --buy config/buy.yaml --sell config/sell.yaml [--dry-run] [--check-first]
+                   [--test-in N | --check | --loop]
 ```
 
 Other options: `--env PATH` (another .env file), `--log-dir`, `--journal`, `-v` (debug logging).
 
+`--check-first` is for a single run: a failed check ends the run at once (exit
+code `1`) instead of seconds before the time. Together with `--loop` it is
+refused (exit code `2`): in a loop the checks run at the prearm of every day.
+
 Exit codes: `0` success, `1` error (connection, preflight or order failed),
-`2` config error or invalid pair, `3` skipped (too late, spread too wide, or
-already traded today), `130` stopped with Ctrl+C.
+`2` config error or invalid pair, `3` skipped (too late or spread too wide),
+`130` stopped with Ctrl+C.
 
-### One position per day
+### No limit per day
 
-Before arming, each app refuses to open when:
+Every run opens one position, as often as you start it. Nothing looks at what
+was opened earlier: not a position that is still open, not the account history,
+not the journal. Several positions with the same magic number can be open at
+once on a hedging account, each with its own take profit, and each run follows
+the position it opened itself.
 
-- a position with the same **magic number and symbol** is still open on its account
-  (from any day), or
-- its account history shows that it already opened one **today** (schedule timezone), or
-- `data/journal.csv` already has an `opened` row for this app today.
-
-A blocked side is logged, sent to Telegram, and written to the journal as
-`skipped_exists`. Note that this check runs **per account**. If yesterday's BUY is
-still open but yesterday's SELL hit its TP, today only the SELL side opens.
+One thing stays: a **netting** account holds only one position per symbol, so a
+new order would be merged into the open one and its take profit would no longer
+fit. On a netting account the app therefore still stops while a position in the
+symbol is open.
 
 ### Timing rules
 
@@ -411,7 +443,10 @@ still open but yesterday's SELL hit its TP, today only the SELL side opens.
   Every other error stops immediately. If the terminal gives no reply, the app
   checks whether a position appeared before reporting failure, and never re-sends.
 - `max_late_ms`: if the order would go out later than this after the target
-  (PC asleep, very slow connect), the app does **not** open.
+  (PC asleep, MetaTrader 5 slow to start), the app does **not** open.
+- The trigger is a clock on the PC and nothing else. The broker's server time
+  is never used to decide when to open, so it does not matter which time zone
+  the broker runs on or what time MetaTrader 5 shows.
 - `max_spread_points`: if set and the spread at the target is wider, the app skips.
 - Telegram messages are sent from a background thread with a 5 s timeout and
   are held back around the trigger moment, so they never delay an order.
@@ -426,7 +461,7 @@ still open but yesterday's SELL hit its TP, today only the SELL side opens.
   stop-out / manual), profit, max adverse, max favourable, plus SL, close price,
   swap, commission, duration, ticket, attempts, status and note.
   `status` is one of `opened`, `dry_run`, `failed`, `error`, `skipped_late`,
-  `skipped_spread`, `skipped_exists`.
+  `skipped_spread`. There is one row per run, so several rows per day are normal.
 - If `journal.csv` is open in Excel (locked), the row is saved to
   `data/journal_unsaved_*.csv` instead of being lost.
 
@@ -446,15 +481,16 @@ Telegram (optional): create a bot with **@BotFather**, put its token in
 | `Symbol 'XAUUSD' does not exist ... Similar symbols: XAUUSD.m, GOLD` | Use the broker's exact name in **both** configs, e.g. `symbol: XAUUSD.m` or `symbol: GOLD`. |
 | `market is closed` / `price is N min old` | Run during market hours (gold: Mon–Fri, with a daily break around midnight server time). `--check` only warns about this. |
 | `REAL account and allow_real_account is false` | Intended safety stop. Use a demo account, or set `allow_real_account: true` deliberately. |
-| `PC clock is N ms behind/ahead` | Scheduling is corrected via NTP anyway, but fix the clock: Settings → Time & language → Date & time → **Sync now**, or in an admin PowerShell `w32tm /resync`. Make sure "Set time automatically" is on. |
+| `PC clock is N s behind/ahead of internet time` | Fix the clock: Settings → Time & language → Date & time → **Sync now**, or in an admin PowerShell `w32tm /resync`. Make sure "Set time automatically" is on. The Aitrade window opens the positions by the PC clock as it is. Only the command-line engine with `use_ntp_offset: true` corrects for the difference by itself. |
 | `woke up N s after the target ... not opening` | The PC slept or was busy. Settings → System → Power → Screen and sleep → *When plugged in, put my device to sleep after*: **Never**. |
-| `Prearm finished only N s before the target` | Connecting took long (terminal was closed?). Keep the terminals open, or raise `prearm_seconds`. |
+| `MetaTrader 5 was ready N s after the target` / `not ready in time` | The time was too close for MetaTrader 5 to start and log in. Nothing was opened. Choose a time a little later and run again: MetaTrader 5 is open now, so it is ready within seconds. |
+| `The BUY (SELL) account did not get through its checks, so the ... side was stopped too` | Aitrade opens both sides or none. Fix what the red text says for that account, then press Run again. |
+| `Prearm finished only N s before the target` | Connecting took long (terminal was closed?). Start with `--check-first`, keep the terminals open, or raise `prearm_seconds`. |
 | `not a known IANA timezone` | Use names like `Europe/Copenhagen`. If the name is right, rerun `scripts\setup.ps1` (installs `tzdata`). |
 | `put the time in quotes` | Write `time: "14:29:45"` with quotes. |
 | `found unknown escape character` | Use single quotes for Windows paths: `'C:\MT5_Buy\terminal64.exe'`. |
 | `The two configs are not a valid pair` | The message lists each difference. Make those fields identical (or different, for login / terminal_path / name). |
 | `setup.ps1 cannot be loaded because running scripts is disabled` | Run it as shown: `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`. |
-| One side `skipped_exists` | A position from an earlier day is still open, or the app already traded today. See [one position per day](#one-position-per-day). |
 
 ## Use the project on another PC
 
@@ -482,9 +518,15 @@ in again. To get updates later: `git pull`, then run `scripts\setup.ps1` again.
 - **Both sides can lose.** In a whipsaw, the price can move toward one TP,
   reverse, and travel far the other way. Spread, commission and swap are paid
   twice, and slippage on either fill shifts both TPs.
-- **The two sides are independent.** If one app fails (connection, margin,
-  requote limit, PC asleep) and the other opens, you hold an unhedged position.
-  Watch the `[PAIR]` summary and your Telegram messages.
+- **One side can still open alone.** The Aitrade window stops the other side
+  when one side fails or is not ready before the time. But the two orders go
+  to two brokers at the same moment: if one broker refuses its order at that
+  moment (not enough margin, market closed, requote limit), the other position
+  is already open and you hold an unhedged position. On the command line
+  (`run_pair.py`) the two sides are fully independent. Watch the window, the
+  `[PAIR]` summary and your Telegram messages.
+- **More than one run a day adds up.** There is no limit per day, so every run
+  adds two more positions and needs its own margin on each account.
 - Broker execution, gaps and outages are outside this program's control. Test on
   demo accounts first, and only trade money you can afford to lose.
 
@@ -495,6 +537,8 @@ inside MT5 (one copy per terminal; Direction = Buy on one, Sell on the other).
 To use it: in each terminal, File → Open Data Folder → `MQL5\Experts`, copy the
 file there, compile it in MetaEditor (F7), and drag it onto a chart. It uses
 the PC clock by default and has no NTP correction, pair validation or journal.
+Unlike the app, the EA has one fixed time per day: it opens at most once a day
+and not while its own position is still open.
 
 ## Running the tests
 
@@ -505,8 +549,10 @@ the PC clock by default and has no NTP correction, pair validation or journal.
 The tests mock MT5 completely (they run without MetaTrader installed). They
 cover target times (including the DST change days in Europe/Copenhagen and a
 UTC-based PC), TP/SL from money for buy and sell, tick rounding, lot steps,
-filling mode, pair validation, the `max_late_ms` rule, the one-position-per-day
-guard, the retry rules, and full simulated runs.
+filling mode, pair validation, the `max_late_ms` rule, several runs on one day,
+the retry rules, and full simulated runs. `tests/test_pair_processes.py` starts
+the two real engine processes against a pretend broker and checks, on the real
+clock, that both open at the set second and that it is both sides or none.
 
 ## Project layout
 
