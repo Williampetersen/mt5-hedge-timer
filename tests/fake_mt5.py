@@ -148,7 +148,9 @@ class FakeMT5:
         return tuple(out)
 
     def history_deals_get(self, *args, position=None, ticket=None):
-        out = [d for d in self.deals if position is None or d.position_id == position]
+        """position=: the deals of that position. ticket=: the deals made by that ORDER (as in MT5)."""
+        out = [d for d in self.deals
+               if (position is None or d.position_id == position) and (ticket is None or d.order == ticket)]
         return tuple(out)
 
     # --- test helpers

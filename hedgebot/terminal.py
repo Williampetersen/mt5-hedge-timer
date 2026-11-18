@@ -6,7 +6,9 @@ Account" window, which blocks the Python connection. So the engine starts the
 terminal first, with a small start-up file (the documented /config key):
 Algo Trading on and, only for a terminal that has never logged in, the account
 to log into. That file is written to the user's private temp folder and
-deleted as soon as the terminal has read it.
+deleted as soon as the terminal has read it. A file that an engine could not
+delete itself (it was stopped half-way) is deleted at the next start, and by
+the Aitrade window a few seconds after it stops a run.
 
 Set HEDGEBOT_LAUNCH=0 to switch all of this off (the Python package then
 starts the terminal on its own, as before).
@@ -32,6 +34,7 @@ MAIN_WINDOW_CLASS = "MetaQuotes::MetaTrader"  # the terminal's main window class
 DIALOG_CLASS = "#32770"
 WM_CLOSE = 0x0010
 MIN_CONFIG_LIFETIME_S = 5.0  # keep the start-up file at least this long, so the terminal has read it
+STARTUP_PREFIX, STARTUP_SUFFIX = "mt5-start-", ".ini"  # the name of every start-up file
 
 # What ensure_started() did.
 SKIPPED, RUNNING, STARTED, FIRST_LOGIN, FAILED = "skipped", "running", "started", "first_login", "failed"
@@ -104,15 +107,51 @@ def startup_config_text(*, login: Optional[int] = None, server: Optional[str] = 
     return "\r\n".join(lines) + "\r\n"
 
 
+def startup_folder() -> Path:
+    """Where the start-up files are written: the user's private temp folder."""
+    return Path(tempfile.gettempdir())
+
+
 def write_startup_config(text: str, folder: Optional[Path] = None) -> Path:
     """Write the start-up file (UTF-16, like the terminal's own files) into the user's temp folder."""
-    fd, name = tempfile.mkstemp(prefix="mt5-start-", suffix=".ini", dir=str(folder) if folder else None)
+    fd, name = tempfile.mkstemp(prefix=STARTUP_PREFIX, suffix=STARTUP_SUFFIX,
+                                dir=str(folder if folder else startup_folder()))
     with os.fdopen(fd, "wb") as fh:
         fh.write(b"\xff\xfe" + text.encode("utf-16-le"))
     return Path(name)
 
 
+def delete_stale_startup_files(min_age_s: Optional[float] = None, folder: Optional[Path] = None) -> int:
+    """Wipe and delete start-up files that an engine left behind. Returns how many are gone.
+
+    An engine deletes its own start-up file, but one that is stopped half-way
+    (the window stops the run, the PC is switched off) cannot. Such a file may
+    hold a password, so it must not stay on the disk. Files younger than
+    min_age_s (default: MIN_CONFIG_LIFETIME_S) are left alone: a terminal that
+    is just starting may still have to read its file.
+    """
+    min_age = MIN_CONFIG_LIFETIME_S if min_age_s is None else float(min_age_s)
+    folder = Path(folder) if folder is not None else startup_folder()
+    try:
+        candidates = list(folder.glob(f"{STARTUP_PREFIX}*{STARTUP_SUFFIX}"))
+    except OSError:
+        return 0
+    removed = 0
+    now = time.time()
+    for path in candidates:
+        try:
+            if now - path.stat().st_mtime < min_age:
+                continue
+        except OSError:
+            continue  # gone meanwhile: its own engine deleted it
+        _delete(path)
+        removed += 0 if path.exists() else 1
+    return removed
+
+
 def _delete(path: Path) -> None:
+    if not path.exists():
+        return  # already gone (cleaned up by the window or by the other engine)
     try:
         size = path.stat().st_size
         with open(path, "r+b") as fh:  # overwrite before deleting: the file may hold a password
@@ -319,6 +358,10 @@ def ensure_started(
     """
     if not launch_enabled():
         return Launch(SKIPPED)
+    try:
+        delete_stale_startup_files()  # left by an engine that was stopped before it could delete its own
+    except Exception as exc:  # tidying up must never stop a run
+        log.debug("could not clean up old start-up files: %s", exc)
     if is_running(exe):
         title = blocking_dialog(exe)
         if title:  # opened by hand and stuck behind a window: clear the way for the connection

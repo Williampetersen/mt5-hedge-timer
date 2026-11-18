@@ -7,11 +7,26 @@ from functools import partial
 from pathlib import Path
 from typing import Mapping, Optional
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
+
+from hedgebot import terminal as engine_terminal
 
 from .. import paths
 from ..runner import FAILED, SideState, parse_line, worker_command, worker_env
 from ..settings import SIDES
+
+
+# After a stop: when the start-up file of a MetaTrader 5 that was being started may be deleted.
+STARTUP_CLEANUP_MS = int(engine_terminal.MIN_CONFIG_LIFETIME_S * 1000) + 1000
+
+
+def delete_startup_files(min_age_s=None) -> None:
+    """A stopped engine cannot delete the start-up file of the MetaTrader 5 it was starting, and for a
+    first login that file holds the password. So the window deletes what is left behind."""
+    try:
+        engine_terminal.delete_stale_startup_files(min_age_s)
+    except Exception:  # tidying up must never disturb the window
+        pass
 
 
 class PairSession(QObject):
@@ -66,10 +81,14 @@ class PairSession(QObject):
 
     def stop(self) -> None:
         """End both processes now. Positions that are already open stay open in MT5."""
+        killed = False
         for side, proc in self._procs.items():
             if proc.state() != QProcess.ProcessState.NotRunning:
                 self.states[side].stop_requested = True
                 proc.kill()
+                killed = True
+        if killed:
+            QTimer.singleShot(STARTUP_CLEANUP_MS, delete_startup_files)
 
     @property
     def active(self) -> bool:

@@ -47,6 +47,11 @@ def home(tmp_path, monkeypatch):
     return exes
 
 
+# Seconds from pressing Run to the set time in the runs below. Both sides have to be ready
+# two seconds before the time, so this leaves room for a slow PC to start the two engines.
+RUN_LEAD_S = 12
+
+
 def pump(seconds=0.05):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -195,6 +200,12 @@ def test_run_screen_shows_the_plan_and_blocks_bad_input(qapp, home):
     assert page.plan_form.time.text() == "14:29:45" and page.run_btn.text() == "Run"
     assert "Run opens both positions at 2030-01-02 14:29:45" in page.sub.text()
 
+    soon = datetime.now() + timedelta(seconds=3)  # not passed, but too soon to get two accounts ready
+    page.plan_form.date.setDate(QDate(soon.year, soon.month, soon.day))
+    page.plan_form.time.setText(soon.strftime("%H:%M:%S"))
+    page.run_btn.click()
+    assert not page.active and "less than 5 seconds away" in page.errors.text()
+
     page.plan_form.date.setDate(QDate(2026, 1, 1))  # a day in the past
     pump()
     assert "already passed" in page.sub.text()
@@ -243,7 +254,7 @@ def test_a_wrong_password_is_reported_for_that_side_only(qapp, home, monkeypatch
 
 
 def test_practice_run_sends_nothing(qapp, home, monkeypatch):
-    monkeypatch.setattr(run_page_module, "PRACTICE_LEAD_S", 7)
+    monkeypatch.setattr(run_page_module, "PRACTICE_LEAD_S", RUN_LEAD_S)
     window = open_window(saved_setup(home))
     page = window.run_page
     page.practice_btn.click()
@@ -264,12 +275,12 @@ def test_practice_run_sends_nothing(qapp, home, monkeypatch):
 def test_a_run_opens_both_sides_at_the_set_second_and_follows_them(qapp, home):
     window = open_window(saved_setup(home))
     page = window.run_page
-    target = datetime.now().replace(microsecond=0) + timedelta(seconds=8)
+    target = datetime.now().replace(microsecond=0) + timedelta(seconds=RUN_LEAD_S)
     page.plan_form.date.setDate(QDate(target.year, target.month, target.day))
     page.plan_form.time.setText(target.strftime("%H:%M:%S"))
     page.run_btn.click()
     assert page.active, page.errors.text()
-    assert page.phase == run_page_module.RUN  # too close to the time for the pre-test
+    assert page.phase == run_page_module.RUN
     assert not page.plan_form.lots.isEnabled()  # the plan is locked while it runs
     assert wait_until(lambda: page.headline.text().startswith("Opens in"), timeout=10)
     assert wait_until(lambda: all(s.has_position for s in page.session.states.values()), timeout=30)
@@ -286,17 +297,46 @@ def test_a_run_opens_both_sides_at_the_set_second_and_follows_them(qapp, home):
     window.close()
 
 
-def test_run_with_time_to_spare_tests_the_accounts_first_and_stop_ends_it(qapp, home):
+def test_a_second_run_on_the_same_day_opens_again(qapp, home):
+    """There is no limit per day: run, and when it is done set a new time and run again.
+
+    Each run talks to a fresh pretend broker, so no earlier position is open here; what
+    carries over is the journal, which used to block the second run of a day.
+    """
     window = open_window(saved_setup(home))
     page = window.run_page
-    target = datetime.now() + timedelta(minutes=30)
+    for run_number in (1, 2):
+        target = datetime.now().replace(microsecond=0) + timedelta(seconds=RUN_LEAD_S)
+        page.plan_form.date.setDate(QDate(target.year, target.month, target.day))
+        page.plan_form.time.setText(target.strftime("%H:%M:%S"))
+        page.run_btn.click()
+        assert page.active, page.errors.text()
+        assert wait_until(lambda: all(s.has_position for s in page.session.states.values()), timeout=30), \
+            {k: (v.state, v.message) for k, v in page.session.states.items()}
+        assert wait_until(lambda: not page.active, timeout=30)
+        assert {s.state for s in page.session.states.values()} == {runner.CLOSED}
+        journal = paths.journal_file().read_text(encoding="utf-8")
+        assert journal.count("opened") == 2 * run_number and "skipped" not in journal
+    window.close()
+
+
+def test_run_with_time_to_spare_checks_both_accounts_at_once_and_stop_ends_it(qapp, home):
+    window = open_window(saved_setup(home))
+    page = window.run_page
+    target = datetime.now() + timedelta(minutes=29, seconds=30)
     page.plan_form.date.setDate(QDate(target.year, target.month, target.day))
     page.plan_form.time.setText(target.strftime("%H:%M:%S"))
     page.run_btn.click()
-    assert page.active and page.phase == run_page_module.PRECHECK
-    assert wait_until(lambda: page.phase == run_page_module.RUN, timeout=40), page.errors.text()
-    assert wait_until(lambda: all(s.state == runner.WAITING for s in page.session.states.values()), timeout=20)
-    assert page.headline.text().startswith("Opens in 00:2")
+    assert page.active and page.phase == run_page_module.RUN, page.errors.text()
+    # Half an hour before the time both accounts are already connected and checked.
+    assert wait_until(lambda: all(s.state == runner.READY for s in page.session.states.values()), timeout=40), \
+        {k: (v.state, v.message) for k, v in page.session.states.items()}
+    states = page.session.states
+    assert states["buy"].snapshot["login"] == 1001 and states["sell"].snapshot["symbol"] == "XAUUSD.m"
+    assert page.headline.text().startswith("Opens in 00:2")  # 29 minutes and some seconds
+    assert page.sub.text().startswith("Both accounts are ready. Set for ") and "this PC's clock" in page.sub.text()
+    assert page.cards["buy"].state.text() == "Ready – waiting for the time"
+    assert "Take profit 150.00 USD" in page.cards["buy"].details.text()
     page.stop()  # the button asks "Stop now?" first; this is what Yes does
     assert wait_until(lambda: not page.active, timeout=15)
     assert {s.state for s in page.session.states.values()} == {runner.STOPPED}
@@ -305,17 +345,45 @@ def test_run_with_time_to_spare_tests_the_accounts_first_and_stop_ends_it(qapp, 
     window.close()
 
 
-def test_a_failed_pre_test_does_not_start_the_run(qapp, home, monkeypatch):
+def test_a_slow_metatrader_on_one_side_means_nothing_opens(qapp, home, monkeypatch):
+    """The time is near and one MetaTrader 5 needs a minute: the side that is ready must not open alone."""
+    monkeypatch.setenv("FAKE_MT5_SLOW_START", "1001:60")
+    window = open_window(saved_setup(home))
+    page = window.run_page
+    target = datetime.now().replace(microsecond=0) + timedelta(seconds=RUN_LEAD_S)
+    page.plan_form.date.setDate(QDate(target.year, target.month, target.day))
+    page.plan_form.time.setText(target.strftime("%H:%M:%S"))
+    page.run_btn.click()
+    assert page.active, page.errors.text()
+    assert wait_until(lambda: not page.active, timeout=30)
+    assert datetime.now() < target  # it was all over before the set time
+    assert {s.state for s in page.session.states.values()} == {runner.STOPPED}
+    assert "not ready in time for the BUY" in page.errors.text()
+    assert all(s.nothing_sent for s in page.session.states.values())
+    assert page.headline.text() == "Stopped" and page.run_btn.text() == "Run"
+    assert not paths.journal_file().exists()  # nothing was sent
+    window.close()
+
+
+def test_one_account_failing_stops_the_other_side_too(qapp, home, monkeypatch):
     monkeypatch.setenv("FAKE_MT5_FAIL_LOGIN", "1001")
     window = open_window(saved_setup(home))
     page = window.run_page
-    page.run_btn.click()  # 2030: lots of time, so the accounts are tested first
-    assert page.phase == run_page_module.PRECHECK
+    page.run_btn.click()  # 2030: lots of time; both accounts are checked at once
+    assert page.active and page.phase == run_page_module.RUN, page.errors.text()
     assert wait_until(lambda: not page.active, timeout=60)
     pump(0.3)
     assert page.phase == run_page_module.IDLE and not page.active
-    assert "was not started because the test failed" in page.errors.text()
-    assert page.session.states["buy"].state == runner.CHECK_FAILED
+    states = page.session.states
+    assert states["buy"].state == runner.FAILED and "Authorization failed" in states["buy"].message
+    assert states["sell"].state == runner.STOPPED  # it was fine, and was stopped so it cannot open alone
+    assert "BUY account did not get through" in page.errors.text()
+    assert "SELL side was stopped too. Nothing was opened." in page.errors.text()
+    assert page.headline.text() == "It did not work" and page.sub.text().startswith("Nothing was opened.")
+    assert "Could not connect to MT5" in page.cards["buy"].details.text()
+    assert page.run_btn.text() == "Run" and page.plan_form.lots.isEnabled()
+    journal = paths.journal_file().read_text(encoding="utf-8")
+    assert "opened" not in journal and "dry_run" not in journal  # only the BUY side's error row
     window.close()
 
 

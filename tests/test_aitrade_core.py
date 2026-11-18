@@ -216,6 +216,18 @@ def test_engine_config_has_the_app_values(tmp_path):
         assert cfg["schedule"]["timezone"] == "local" and cfg["schedule"]["weekdays"] == []
 
 
+def test_only_the_pc_clock_decides_the_time(tmp_path):
+    """The engine never shifts the PC clock by internet time, whatever the saved settings say."""
+    s = make_settings(tmp_path)
+    for use_ntp in (True, False):
+        s.advanced.use_ntp = use_ntp
+        for side in ("buy", "sell"):
+            assert build_engine_config(s, side)["schedule"]["use_ntp_offset"] is False
+    _, _, configs = check_engine_configs(s, {"buy": "pw-b", "sell": "pw-s"})
+    assert configs["buy"].schedule.use_ntp_offset is False and configs["sell"].schedule.use_ntp_offset is False
+    assert configs["buy"].schedule.timezone == "Europe/Copenhagen"  # the PC's own zone
+
+
 def test_the_engine_accepts_what_the_app_writes(tmp_path):
     s = make_settings(tmp_path)
     errors, warnings, configs = check_engine_configs(s, {"buy": "pw-b", "sell": "pw-s"})

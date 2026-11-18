@@ -1,7 +1,6 @@
 import logging
 import threading
 import time
-from datetime import date
 
 from hedgebot.journal import COLUMNS, Journal
 from hedgebot.notify import Notifier
@@ -20,15 +19,6 @@ def test_journal_writes_header_once_and_rows(tmp_path):
     assert rows[1]["note"] == "line1 line2"
 
 
-def test_journal_opened_on(tmp_path):
-    j = Journal(tmp_path / "journal.csv")
-    j.append({"date": "2026-11-16", "app_name": "buy-account", "login": 1001, "status": "opened"})
-    j.append({"date": "2026-11-17", "app_name": "buy-account", "login": 1001, "status": "dry_run"})
-    assert j.opened_on("buy-account", 1001, date(2026, 11, 16))
-    assert j.opened_on("buy-account", 1001, date(2026, 11, 17)) is None
-    assert j.opened_on("sell-account", 2002, date(2026, 11, 16)) is None
-
-
 def test_journal_upsert_fills_in_the_close_later(tmp_path):
     j = Journal(tmp_path / "journal.csv")
     j.upsert({"app_name": "sell-account", "position_ticket": 7, "status": "opened"})
@@ -39,6 +29,19 @@ def test_journal_upsert_fills_in_the_close_later(tmp_path):
     assert len(rows) == 3
     assert rows[1]["app_name"] == "buy-account" and rows[1]["close_reason"] == "TP" and rows[1]["note"] == ""
     assert rows[0]["close_reason"] == ""  # the other app's row with the same ticket number is untouched
+
+
+def test_journal_upsert_never_overwrites_an_earlier_run(tmp_path):
+    """Several runs a day; a ticket number that comes back (another account) is still a new row."""
+    j = Journal(tmp_path / "journal.csv")
+    first = {"app_name": "buy", "position_ticket": 7, "status": "opened", "target_time": "2026-11-18 10:00:00.000 CET"}
+    later = {"app_name": "buy", "position_ticket": 7, "status": "opened", "target_time": "2026-11-18 14:29:45.000 CET"}
+    j.upsert(dict(first, note="monitoring"))
+    j.upsert(dict(first, close_reason="TP"))  # the same run: its row is filled in
+    j.upsert(dict(later, note="monitoring"))  # a later run: a row of its own
+    j.upsert(dict(later, close_reason="SL"))
+    rows = j.rows()
+    assert [(r["target_time"][11:19], r["close_reason"]) for r in rows] == [("10:00:00", "TP"), ("14:29:45", "SL")]
 
 
 def test_journal_concurrent_appends(tmp_path):

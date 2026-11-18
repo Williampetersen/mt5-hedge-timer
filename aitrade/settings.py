@@ -49,9 +49,9 @@ class Plan:
 class Advanced:
     deviation_points: int = 300  # largest accepted slippage
     max_spread_points: Optional[float] = None  # None = open at any spread
-    prearm_seconds: int = 30  # connect to MT5 this long before the time
-    max_late_ms: int = 2000  # if the PC wakes up later than this, do not open
-    use_ntp: bool = True  # correct the PC clock with internet time
+    prearm_seconds: int = 30  # the last check before the time (the first runs as soon as Run is pressed)
+    max_late_ms: int = 2000  # if the PC or MetaTrader 5 is ready later than this, do not open
+    use_ntp: bool = True  # compare the PC clock with internet time and warn (the PC clock is never shifted)
     ntp_server: str = "pool.ntp.org"
     monitor_until: str = "23:00:00"  # stop watching the open position at this PC time
     magic: int = 20261115

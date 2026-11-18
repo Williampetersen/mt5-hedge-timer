@@ -103,8 +103,19 @@ def test_check_pair_raises(buy_cfg):
 
 def test_child_args_pass_one_shared_target():
     target = datetime(2026, 11, 16, 13, 29, 45, 123000, tzinfo=timezone.utc)
-    args = SimpleNamespace(env=None, dry_run=True, check=False, loop=False, verbose=False)
+    args = SimpleNamespace(env=None, dry_run=True, check=False, loop=False, check_first=False, verbose=False)
     assert run_pair.child_args(args, target) == ["--dry-run", "--target-at", "2026-11-16T13:29:45.123000+00:00"]
+
+
+def test_child_args_pass_check_first_on():
+    args = run_pair.build_parser().parse_args(["--check-first", "--test-in", "60"])
+    assert run_pair.child_args(args, None) == ["--check-first"]
+    assert run_pair.child_args(run_pair.build_parser().parse_args([]), None) == []
+
+
+def test_run_pair_refuses_check_first_with_the_loop(capsys):
+    assert run_pair.main(["--loop", "--check-first"]) == 2
+    assert "cannot be used with --loop" in capsys.readouterr().err
 
 
 def test_result_line_and_diff():

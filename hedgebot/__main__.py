@@ -5,9 +5,13 @@
   python -m hedgebot --config config/buy.yaml --test-in 60 # target = now + 60 s (demo testing)
   python -m hedgebot --config config/buy.yaml --check      # connect + preflight, then exit
   python -m hedgebot --config config/buy.yaml --loop       # trade every scheduled day
+  python -m hedgebot --config config/buy.yaml --check-first  # test everything now, then wait for the time
 
-Exit codes: 0 ok, 1 error, 2 config/usage error, 3 skipped (late, spread,
-already traded today), 130 interrupted (Ctrl+C).
+There is no limit on how often an app may open: every run opens one position,
+also while positions of earlier runs are still open.
+
+Exit codes: 0 ok, 1 error, 2 config/usage error, 3 skipped (late, spread),
+130 interrupted (Ctrl+C).
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ RESULT_PREFIX = "HEDGEBOT_RESULT "  # machine-readable line for run_pair.py
 EVENT_PREFIX = "HEDGEBOT_EVENT "  # machine-readable progress lines for the desktop app
 CHILD_ENV = "HEDGEBOT_CHILD"
 PNL_EVENT_EVERY_S = 2.0
+# --check-first: the early check is a second connect, only worth it when it ends well before the prearm.
+EARLY_CHECK_MARGIN_S = 30.0
 
 
 # --------------------------------------------------------------------------- logging
@@ -134,7 +140,7 @@ def _f(value, decimals: int) -> str:
 
 
 class HedgeApp:
-    """Runs one app (one direction, one terminal) through a scheduled day."""
+    """Runs one app (one direction, one terminal) through one run."""
 
     def __init__(
         self,
@@ -149,9 +155,13 @@ class HedgeApp:
         sleep: Optional[Callable[[float], None]] = None,
         boost: bool = True,
         emit_results: Optional[bool] = None,
+        check_first: bool = False,
     ):
         self.cfg = cfg
         self.dry_run = dry_run
+        # True: connect and run every check as soon as the run starts (and again at the prearm),
+        # so a problem shows at once and MetaTrader 5 is open and logged in long before the time.
+        self.check_first = check_first
         self.notifier = notifier or Notifier()
         self.journal = journal or Journal(PROJECT_ROOT / "data" / "journal.csv")
         self.clock = clock or clk.Clock()
@@ -372,14 +382,10 @@ class HedgeApp:
             pf = client.preflight(strict_market=False)
             self._digits = pf.digits
             self._log_preflight(pf)
-            day = (target or self.clock.now()).astimezone(self.tz).date()
-            reason = client.existing_trade(day, self.tz, pf.server_offset_s)
-            if reason:
-                log.warning("On %s the app would SKIP: %s", day.isoformat(), reason)
             log.info("CHECK PASSED for %s (%s account %s). Nothing was sent.", self.cfg.name, pf.account_kind,
                      self.cfg.account.login)
-            self._event("check", ok=True, skip_reason=reason or "",
-                        clock_offset_ms=self.clock.offset_s * 1000.0, **self._snapshot(client, pf))
+            self._event("check", ok=True, clock_offset_ms=self.clock.offset_s * 1000.0,
+                        **self._snapshot(client, pf))
             return EXIT_OK
         except Mt5Error as exc:
             log.error("CHECK FAILED: %s", exc)
@@ -393,9 +399,13 @@ class HedgeApp:
             if client is not None:
                 client.shutdown()
 
-    def run_once(self, target: Optional[datetime] = None) -> int:
-        """One scheduled day: wait, prearm, fire, correct TP, monitor, journal."""
+    def run_once(self, target: Optional[datetime] = None, *, check_first: Optional[bool] = None) -> int:
+        """One run: (check everything now,) wait, prearm, fire, correct TP, monitor, journal.
+
+        check_first overrides the app's own setting for this run (the loop switches it off).
+        """
         s = self.cfg.schedule
+        check_first = self.check_first if check_first is None else check_first
         self.sync_clock("startup")
         if target is None:
             try:
@@ -410,6 +420,17 @@ class HedgeApp:
                     prearm_ts=target_ts - s.prearm_seconds, clock_offset_ms=self.clock.offset_s * 1000.0)
 
         prearm_ts = target_ts - s.prearm_seconds
+        if check_first:
+            if self.clock.time() < prearm_ts - EARLY_CHECK_MARGIN_S:
+                code = self._early_check(target_ts)
+                if code != EXIT_OK:
+                    return code
+                if clk.late_ms(self.clock.time(), target_ts) > s.max_late_ms:
+                    return self._skip_not_ready_in_time(target_ts)  # e.g. a first start that took minutes
+            elif self.clock.time() < prearm_ts:
+                # Close to the time: do not sit idle until the prearm, get ready now.
+                log.info("The target is close: connecting now, not %g s before it", s.prearm_seconds)
+                prearm_ts = self.clock.time()
         if self.clock.time() < prearm_ts:
             log.info("Waiting until prearm at %s", self.fmt(prearm_ts))
             while self.clock.time() < prearm_ts:
@@ -428,6 +449,59 @@ class HedgeApp:
             self._emit(target_ts, "skipped_late", note=msg)
             return EXIT_SKIPPED
         return self._armed_run(target_ts)
+
+    def _skip_not_ready_in_time(self, target_ts: float) -> int:
+        """MetaTrader 5 and the checks took until after the target (+ max_late_ms): nothing is opened."""
+        late_s = self.clock.time() - target_ts
+        msg = (f"MetaTrader 5 was ready {late_s:.1f} s after the target {self.fmt(target_ts)}, so nothing "
+               "was opened. Choose a later time: MetaTrader 5 is open now, so the next start is quick")
+        log.error("SKIPPED: %s", msg)
+        self.notify("SKIPPED: " + msg)
+        self._journal(target_ts, "skipped_late", msg)
+        self._emit(target_ts, "skipped_late", note=msg)
+        return EXIT_SKIPPED
+
+    def _early_check(self, target_ts: float) -> int:
+        """Connect and run every check right now, long before the target.
+
+        A problem (password, symbol, lot size, margin, Algo Trading) shows at once
+        instead of seconds before the time, and MetaTrader 5 is left open and logged
+        in, so the prearm connect is quick. A closed market is only a warning here.
+        Nothing is sent. The connection is closed again; the prearm makes a new one.
+        """
+        log.info("CHECKING NOW: %s before the target (the checks run again %g s before it)",
+                 clk.fmt_duration(target_ts - self.clock.time()), self.cfg.schedule.prearm_seconds)
+        self._event("checking", target_ts=target_ts)
+        client = None
+        try:
+            client = self.client_factory(self.cfg, self.clock, self.sleep)
+            client.connect()
+            client.check_account()
+            pf = client.preflight(strict_market=False)
+            self._digits = pf.digits
+            self._log_preflight(pf)
+            log.info("READY: every check passed for %s (%s account %s). Nothing was sent.", self.cfg.name,
+                     pf.account_kind, self.cfg.account.login)
+            self._event("ready", target_ts=target_ts, dry_run=self.dry_run,
+                        clock_offset_ms=self.clock.offset_s * 1000.0, **self._snapshot(client, pf))
+            return EXIT_OK
+        except Mt5Error as exc:
+            log.error("ERROR: %s", exc)
+            self.notify(f"ERROR: {exc}")
+            self._journal(target_ts, "error", str(exc))
+            self._emit(target_ts, "error", note=str(exc))
+            return EXIT_ERROR
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # e.g. the MT5 package itself failing: report it, do not just die
+            log.exception("Unexpected error: %s", exc)
+            self.notify(f"ERROR (unexpected): {exc}")
+            self._journal(target_ts, "error", f"unexpected error: {exc}")
+            self._emit(target_ts, "error", note=f"unexpected error: {exc}")
+            return EXIT_ERROR
+        finally:
+            if client is not None:
+                client.shutdown()
 
     def _armed_run(self, target_ts: float) -> int:
         c, s = self.cfg, self.cfg.schedule
@@ -450,23 +524,17 @@ class HedgeApp:
             if pf.margin_warning:
                 self.notify("WARNING: " + pf.margin_warning)
 
-            target_day = datetime.fromtimestamp(target_ts, self.tz).date()
-            reason = (client.existing_trade(target_day, self.tz, pf.server_offset_s)
-                      or self.journal.opened_on(c.name, c.account.login, target_day))
-            if reason:
-                log.warning("SKIPPED (one position per day): %s", reason)
-                self.notify(f"SKIPPED: {reason}")
-                self._journal(target_ts, "skipped_exists", reason)
-                journaled = True
-                self._emit(target_ts, "skipped_exists", note=reason)
-                return EXIT_SKIPPED
-
             lead = target_ts - self.clock.time()
+            if -lead * 1000.0 > s.max_late_ms:
+                journaled = True
+                return self._skip_not_ready_in_time(target_ts)
             log.info("ARMED: %s %g %s at %s (in %.1f s)%s", c.direction.upper(), c.trade.lots, pf.symbol,
                      self.fmt(target_ts), lead, " [DRY-RUN: order_check only]" if self.dry_run else "")
-            if lead < 2:
-                log.warning("Prearm finished only %.1f s before the target; consider a larger prearm_seconds",
-                            lead)
+            if lead < 0:
+                log.warning("The checks finished %.1f s after the target; opening now", -lead)
+            elif lead < 2:
+                log.warning("Prearm finished only %.1f s before the target; start earlier or use a larger "
+                            "prearm_seconds", lead)
             self._event("armed", target_ts=target_ts, dry_run=self.dry_run,
                         clock_offset_ms=self.clock.offset_s * 1000.0, **self._snapshot(client, pf))
             self.notify(f"ARMED: {c.direction.upper()} {c.trade.lots:g} {pf.symbol} at {self.fmt(target_ts)}, "
@@ -607,7 +675,9 @@ class HedgeApp:
                 return EXIT_CONFIG
             last_target_ts = target.timestamp()
             try:
-                code = self.run_once(target)
+                # Never check first here: a check that fails a day ahead would give that day up at once
+                # (and the next, and the next). In a loop the check belongs to the prearm.
+                code = self.run_once(target, check_first=False)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -637,6 +707,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--test-in", type=float, metavar="SECONDS",
                       help="ignore the schedule: target = now + SECONDS (for DEMO testing)")
     mode.add_argument("--target-at", metavar="ISO_TIME", help=argparse.SUPPRESS)  # set by run_pair.py
+    p.add_argument("--check-first", action="store_true",
+                   help="for a single run (not with --loop): connect and run every check as soon as the "
+                        "run starts, and again before the target, so a problem shows at once and "
+                        "MetaTrader 5 is open and logged in early")
     p.add_argument("--log-dir", default=str(PROJECT_ROOT / "logs"), help="log folder (default: logs/)")
     p.add_argument("--journal", default=str(PROJECT_ROOT / "data" / "journal.csv"),
                    help="journal CSV (default: data/journal.csv)")
@@ -656,6 +730,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.test_in is not None and args.test_in <= 0:
         print("--test-in must be a positive number of seconds", file=sys.stderr)
         return EXIT_CONFIG
+    if args.loop and args.check_first:
+        print("--check-first is for a single run and cannot be used with --loop "
+              "(in a loop the checks run at the prearm of every day)", file=sys.stderr)
+        return EXIT_CONFIG
     try:
         cfg = load_config(args.config, env_file=args.env)
     except ConfigError as exc:
@@ -667,7 +745,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.check and clk.prevent_sleep():
         log.info("Windows will not go to sleep while this app runs (keep this window open)")
     notifier = Notifier(cfg.telegram_token, cfg.telegram_chat_id, prefix=cfg.name)
-    app = HedgeApp(cfg, dry_run=args.dry_run, notifier=notifier, journal=Journal(args.journal))
+    app = HedgeApp(cfg, dry_run=args.dry_run, notifier=notifier, journal=Journal(args.journal),
+                   check_first=args.check_first)
     try:
         if args.check:
             return app.run_check()

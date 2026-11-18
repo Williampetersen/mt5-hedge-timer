@@ -3,6 +3,7 @@
   python run_pair.py                                   # config/buy.yaml + config/sell.yaml, scheduled
   python run_pair.py --buy config/buy.yaml --sell config/sell.yaml --test-in 60
   python run_pair.py --dry-run | --check | --loop
+  python run_pair.py --check-first                     # test both sides at once, then wait for the time
 
 With --test-in N one shared target timestamp is computed here and passed to
 both children, so they fire on exactly the same instant. Each child's output
@@ -44,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--loop", action="store_true", help="keep running and trade every scheduled day")
     mode.add_argument("--test-in", type=float, metavar="SECONDS",
                       help="one shared target = now + SECONDS for both sides (DEMO testing)")
+    p.add_argument("--check-first", action="store_true",
+                   help="for a single run (not with --loop): connect and run every check on both sides "
+                        "as soon as they start, and again before the target")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -58,6 +62,8 @@ def child_args(args: argparse.Namespace, target: Optional[datetime]) -> list[str
         extra.append("--check")
     if args.loop:
         extra.append("--loop")
+    if args.check_first:
+        extra.append("--check-first")
     if target is not None:
         extra += ["--target-at", target.astimezone(timezone.utc).isoformat()]
     if args.verbose:
@@ -134,6 +140,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.test_in is not None and args.test_in <= 0:
         print("--test-in must be a positive number of seconds", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.loop and args.check_first:
+        print("--check-first is for a single run and cannot be used with --loop", file=sys.stderr)
         return EXIT_CONFIG
     try:
         sys.stdout.reconfigure(errors="replace")

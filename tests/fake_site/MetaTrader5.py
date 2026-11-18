@@ -5,6 +5,7 @@ the real package, so the whole app can be exercised without MT5, a broker or
 any order. Behaviour can be steered with environment variables:
 
   FAKE_MT5_FAIL_LOGIN=<login>   initialize() fails for that account number
+  FAKE_MT5_SLOW_START=<login>:<sec>  initialize() takes that long for that account (a slow MetaTrader start)
   FAKE_MT5_CLOSE_AFTER=<sec>    an opened position hits its take profit after this long (default 12)
   FAKE_MT5_REAL=1               the account reports itself as a real-money account
 """
@@ -38,7 +39,8 @@ def initialize(*args, **kwargs):
         _fake.last_err = (-6, "Terminal: Authorization failed")
         return False
     _fake.account.login = login
-    time.sleep(0.4)  # a real terminal needs a moment
+    slow_login, _, slow_seconds = os.environ.get("FAKE_MT5_SLOW_START", "").partition(":")
+    time.sleep(float(slow_seconds) if slow_seconds and str(login) == slow_login else 0.4)  # it needs a moment
     return _fake.initialize(*args, **kwargs)
 
 

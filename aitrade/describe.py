@@ -22,6 +22,25 @@ CLOSE_REASONS = {
 }
 
 
+CLOCK_WARN_S = 0.5  # a PC clock further than this from internet time is worth a warning
+
+
+def clock_note(offset: Optional[float]) -> tuple[str, bool]:
+    """(text for the window's header, is it a warning) about the PC clock.
+
+    `offset` is how many seconds the PC clock is behind internet time (negative:
+    ahead), or None when internet time could not be reached. It is information
+    only: the positions open by the PC clock, which is never shifted.
+    """
+    if offset is None:
+        return "Internet time not reachable – the PC clock could not be checked", True
+    side = "behind" if offset > 0 else "ahead of"
+    if abs(offset) >= CLOCK_WARN_S:
+        return (f"PC clock is {abs(offset):.1f} s {side} internet time – "
+                "the positions open by the PC clock"), True
+    return f"PC clock checked: {abs(offset) * 1000:.0f} ms {side} internet time", False
+
+
 def money(value: Optional[float], currency: str = "", *, signed: bool = False) -> str:
     if value is None:
         return "-"
@@ -54,6 +73,8 @@ def headline(st: SideState) -> tuple[str, str]:
         return "Waiting for the time", INFO
     if s == r.PREARM:
         return "Connecting to MetaTrader 5…", INFO
+    if s == r.READY:
+        return "Ready – waiting for the time", GOOD
     if s == r.ARMED:
         return "Ready to open", GOOD
     if s == r.CHECK_OK:
@@ -117,12 +138,10 @@ def timing_line(result: dict) -> Optional[str]:
 
 def detail_lines(st: SideState) -> list[str]:
     s = st.state
-    if s == r.STARTING:
+    if s in (r.STARTING, r.WAITING, r.PREARM):
         return [st.activity] if st.activity else []
-    if s == r.WAITING:
-        return ["MetaTrader 5 connects shortly before the time."]
-    if s == r.PREARM:
-        return [st.activity] if st.activity else []
+    if s == r.READY:
+        return snapshot_lines(st.snapshot) + ["Every check passed. They run once more just before the time."]
     if s in (r.ARMED, r.CHECK_OK):
         return snapshot_lines(st.snapshot)
     if s in (r.CHECK_FAILED, r.SKIPPED, r.FAILED):
@@ -221,7 +240,12 @@ def overall(mode: str, buy: SideState, sell: SideState, *, seconds_left: Optiona
         return (f"Only {opened} opened – {other} did not",
                 f"Look at MetaTrader 5 now: the {opened} position is open without the other side.", BAD)
     if any_of(r.FAILED, r.CHECK_FAILED):
-        return "It did not work", "Read the red text below.", BAD
+        if practice:
+            return "It did not work", "Read the red text below. A practice run places nothing.", BAD
+        if buy.nothing_sent and sell.nothing_sent:
+            return "It did not work", "Nothing was opened. Read the red text below.", BAD
+        return ("It did not work",
+                "Read the red text below and look at MetaTrader 5 now: a position may be open.", BAD)
     if any_of(r.SKIPPED):
         return "Not opened", "Read the text below to see why.", WARN
     if both(r.STOPPED) or (not active and any_of(r.STOPPED)):
@@ -229,6 +253,7 @@ def overall(mode: str, buy: SideState, sell: SideState, *, seconds_left: Optiona
     if active:
         if seconds_left is not None and seconds_left > 0:
             what = "Practice in" if practice else "Opens in"
-            return f"{what} {countdown(seconds_left)}", "", INFO
+            ready = "Both accounts are ready." if both(r.READY, r.ARMED) else ""
+            return f"{what} {countdown(seconds_left)}", ready, INFO
         return ("Checking the order…" if practice else "Opening…"), "", INFO
     return "Ready", "", MUTED

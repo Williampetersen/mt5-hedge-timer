@@ -1,4 +1,8 @@
-"""The main window: a header with the PC clock, and either the setup wizard or the run screen."""
+"""The main window: a header with the PC clock, and either the setup wizard or the run screen.
+
+The PC clock in the header is the clock that decides when the positions open.
+It is compared with internet time now and then, only to warn when it is wrong.
+"""
 
 from __future__ import annotations
 
@@ -25,16 +29,17 @@ from PySide6.QtWidgets import (
 from hedgebot import clock as engine_clock
 from hedgebot.config import local_timezone_name
 
-from .. import APP_NAME, __version__, mt5_setup, paths
+from .. import APP_NAME, __version__, describe, mt5_setup, paths
 from ..settings import Settings, load
 from ..vault import Vault
 from . import theme
 from .run_page import RunPage
+from .session import delete_startup_files
 from .widgets import label
 from .wizard import SetupWizard
 
 CLOCK_CHECK_EVERY_MS = 10 * 60 * 1000
-CLOCK_WARN_S = 0.5
+CLOCK_FIX_TIP = "To set the PC clock right: Windows Settings > Time & language > Date & time > Sync now."
 
 
 def zone_label(now: datetime) -> str:
@@ -58,7 +63,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(980, 640)
         self.vault = vault or Vault()
         self.settings: Settings = load(paths.settings_file())
-        self.clock_offset_s = 0.0
         try:
             self.timezone_name = local_timezone_name()
         except Exception:
@@ -140,8 +144,7 @@ class MainWindow(QMainWindow):
 
     def show_run(self) -> None:
         self.wizard = None
-        self.run_page = RunPage(self.settings, self.vault, tz=self.tz, zone_label=self.zone_label,
-                                clock_offset=lambda: self.clock_offset_s)
+        self.run_page = RunPage(self.settings, self.vault, tz=self.tz, zone_label=self.zone_label)
         self.run_page.edit_settings.connect(lambda: self.show_wizard(can_cancel=True))
         self._set_page(self.run_page)
 
@@ -171,18 +174,11 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, name="clock-check", daemon=True).start()
 
     def _on_clock_checked(self, offset: Optional[float]) -> None:
-        if offset is None:
-            self.clock_note.setText("Internet time not reachable – using the PC clock as it is")
-            self.clock_note.setStyleSheet(f"color: {theme.WARN};")
-            return
-        self.clock_offset_s = float(offset)
-        side = "behind" if offset > 0 else "ahead"
-        if abs(offset) >= CLOCK_WARN_S:
-            self.clock_note.setText(f"PC clock is {abs(offset):.1f} s {side} – corrected automatically")
-            self.clock_note.setStyleSheet(f"color: {theme.WARN};")
-        else:
-            self.clock_note.setText(f"PC clock checked: {abs(offset) * 1000:.0f} ms {side}")
-            self.clock_note.setStyleSheet("")
+        """Show how far the PC clock is from internet time. The PC clock is never shifted."""
+        text, warn = describe.clock_note(offset)
+        self.clock_note.setText(text)
+        self.clock_note.setStyleSheet(f"color: {theme.WARN};" if warn else "")
+        self.clock_note.setToolTip(CLOCK_FIX_TIP if warn and offset is not None else "")
 
     # ------------------------------------------------------------ closing
 
@@ -198,8 +194,12 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             page.stop()
+            delete_startup_files(0)  # nothing comes back later to do it once the window is gone
         if self.wizard is not None:
+            busy = self.wizard.busy
             self.wizard.stop_work()
+            if busy:
+                delete_startup_files(0)
         event.accept()
 
 
